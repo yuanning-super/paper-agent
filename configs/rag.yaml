@@ -1,0 +1,31 @@
+# RAG 配置文件（Milvus 向量库 + 文档解析/分块/检索 + MCP 服务器）
+#
+# 修改后重启应用/MCP 服务器生效。也可用环境变量 RAG_CONFIG 指定其他配置文件路径。
+
+milvus:
+  # 本地 Lite 模式：填文件路径（如 data/milvus.db），无需任何服务
+  # 服务器模式：填 Milvus 地址（如 http://localhost:19530）
+  uri: data/milvus.db
+  collection: paper_chunks        # 集合名
+  dim: 512                        # 向量维度（与 embedding 模型输出一致）
+
+embedding:
+  model: BAAI/bge-small-zh-v1.5   # 本地中文 embedding 模型
+  batch_size: 32                  # 批量嵌入大小
+
+chunking:
+  size: 800                       # 分块大小（字符）
+  overlap: 100                    # 分块重叠（字符）
+  content_max_length: 4096        # Milvus 中 content 字段最大长度
+
+retrieval:
+  top_k: 5                        # 默认返回条数
+  bm25_weight: 0.5                # 混合检索 BM25 权重（向量权重 1-w）
+  max_per_paper: 2                # 多样性：每篇论文最多占用的结果名额
+  candidate_scale: 5              # 向量候选 = top_k * candidate_scale（用于融合）
+
+mcp:
+  name: paper-rag                 # MCP 服务器名
+  transport: stdio                # stdio（Claude Code 注册）| sse（HTTP，供其他客户端）
+  host: 127.0.0.1                 # sse 模式监听地址
+  port: 8760                      # sse 模式监听端口
