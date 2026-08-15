@@ -31,7 +31,7 @@ ATOM_NS = {
     "atom": "http://www.w3.org/2005/Atom",
     "arxiv": "http://arxiv.org/schemas/atom",
 }
-ARXIV_ID_RE = re.compile(r"(?:arxiv:)?(\d{4}\.\d{4,5})(?:v\d+)?", re.I)
+ARXIV_ID_RE = re.compile(r"(?:arxiv:)?(\d{4}\.\d{4,5})(?:v\d+)?", re.IGNORECASE)
 GITHUB_RE = re.compile(r"github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 CACHE_TTL = 7 * 24 * 3600  # 7 天
 
@@ -136,8 +136,7 @@ def download_pdf(arxiv_id: str, pdf_url: str) -> Path:
     resp = requests.get(pdf_url, stream=True, timeout=180)
     resp.raise_for_status()
     with open(dest, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=1 << 16):
-            f.write(chunk)
+        f.writelines(resp.iter_content(chunk_size=1 << 16))
     return dest
 
 
@@ -155,10 +154,12 @@ def extract_text(pdf_path: Path) -> tuple[str, bool]:
 
 
 def chunk_text(text: str, size: int | None = None, overlap: int | None = None) -> list[Chunk]:
-    """按字符窗口分块，并带章节标题启发式标注。"""
-    settings = load_settings()
-    size = size or settings.chunk_size
-    overlap = overlap or settings.chunk_overlap
+    """按字符窗口分块，并带章节标题启发式标注。分块参数来自 configs/rag.yaml。"""
+    from .rag.config import load_rag_config
+
+    chunking = load_rag_config().chunking
+    size = size or chunking.size
+    overlap = overlap or chunking.overlap
     pieces = split_sentences_zh(text, size, overlap)
     chunks: list[Chunk] = []
     current_heading: str | None = None

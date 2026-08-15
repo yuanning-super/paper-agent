@@ -1,13 +1,11 @@
-"""通用工具：JSON 修复解析、限流重试、文本截断、章节标题启发式。"""
+"""通用工具：JSON 修复解析、文本截断、分块、章节标题启发式。"""
 
 from __future__ import annotations
 
 import json
 import logging
-import random
 import re
-import time
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger("paper_agent")
 
@@ -20,7 +18,7 @@ def extract_json(text: str) -> Any | None:
         return None
 
     # ① 剥离 markdown 代码块围栏
-    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.S)
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
     if fence:
         text = fence.group(1)
 
@@ -60,41 +58,6 @@ def extract_json(text: str) -> Any | None:
     return None
 
 
-# ---------- 重试 ----------
-
-def retry_on_rate_limit(fn: Callable, retries: int = 3, base_delay: float = 2.0):
-    """429/5xx/网络错误指数退避重试。非重试性异常直接抛出。"""
-    for attempt in range(retries + 1):
-        try:
-            return fn()
-        except Exception as e:  # noqa: BLE001 —— 分类后决定是否重试
-            if attempt >= retries or not _is_retryable(e):
-                raise
-            delay = base_delay * (2**attempt) + random.uniform(0, 1)
-            logger.warning("请求失败（%s），%.1fs 后第 %d/%d 次重试", e, delay, attempt + 1, retries)
-            time.sleep(delay)
-    raise RuntimeError("unreachable")
-
-
-def _is_retryable(e: Exception) -> bool:
-    name = type(e).__module__ + "." + type(e).__name__
-    # anthropic SDK 类型异常
-    if "anthropic" in name:
-        retryable = (
-            "RateLimitError" in name
-            or "APIConnectionError" in name
-            or "InternalServerError" in name
-        )
-        # 5xx APIStatusError
-        if "APIStatusError" in name and getattr(e, "status_code", 0) >= 500:
-            retryable = True
-        return retryable
-    # requests 异常
-    if "requests" in name:
-        return "ConnectionError" in name or "Timeout" in name or "HTTPError" in name
-    return False
-
-
 # ---------- 文本处理 ----------
 
 def truncate(text: str, limit: int, mode: str = "head_tail") -> str:
@@ -131,13 +94,6 @@ def split_sentences_zh(text: str, size: int, overlap: int) -> list[str]:
     return [c for c in chunks if c]
 
 
-_HEADING_PATTERNS = [
-    r"^\s*(?:第[一二三四五六七八九十\d]+[章节部分]|[0-9]+(?:\.[0-9]+)*)\s*[^\n]{0,40}$",
-    r"^\s*(?:Abstract|Introduction|Related Work|Method|Experiments?|Results?|Conclusion|References|Acknowledgments?)\b[^\n]{0,40}$",
-    r"^\s*[A-Z][A-Za-z ]{2,50}\n=+$",
-]
-
-
 def detect_heading(line: str) -> str | None:
     """启发式判断一行是否为章节标题。"""
     line = line.strip()
@@ -145,6 +101,10 @@ def detect_heading(line: str) -> str | None:
         return None
     if re.match(r"^\s*(?:第[一二三四五六七八九十\d]+[章节部分]|[0-9]+(?:\.[0-9]+)*)\s*\S", line):
         return line
-    if re.match(r"^\s*(?:Abstract|Introduction|Related Work|Method|Experiments?|Results?|Conclusion|References)\b", line, re.I):
+    if re.match(
+        r"^\s*(?:Abstract|Introduction|Related Work|Method|Experiments?|Results?|Conclusion|References)\b",
+        line,
+        re.IGNORECASE,
+    ):
         return line
     return None

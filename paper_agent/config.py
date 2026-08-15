@@ -54,22 +54,9 @@ class Settings:
     json_temperature: float = 0.2
     report_temperature: float = 0.7
 
-    # embedding / 检索
-    embed_model: str = "BAAI/bge-small-zh-v1.5"
-    embed_dims: int = 512
-    bm25_weight: float = 0.5  # 混合检索中 BM25 权重，向量权重为 1 - w
-    max_per_paper: int = 2  # 检索结果多样性：每篇论文最多占用的结果名额
-
-    # 分块
-    chunk_size: int = 800  # 字符
-    chunk_overlap: int = 100
-
     # 上下文预算
     full_text_budget: int = 60_000  # 解读报告注入全文的字符上限
     tool_result_limit: int = 8_000  # 工具返回给 LLM 的文本上限（字符）
-
-    # agent loop
-    max_rounds: int = 8
 
     def ensure_dirs(self) -> None:
         for p in (

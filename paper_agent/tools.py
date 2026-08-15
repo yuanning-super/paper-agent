@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -14,8 +15,14 @@ import requests
 from langchain_core.tools import tool
 
 from .config import load_settings
-from .db import get_chunks, get_innovations, get_paper, update_paper
-from .ingestion import extract_text, fetch_arxiv_metadata, ingest_arxiv, normalize_arxiv_id
+from .db import get_chunks, get_paper, update_paper
+from .db import get_innovations as db_get_innovations
+from .ingestion import (
+    extract_text,
+    fetch_arxiv_metadata,
+    ingest_arxiv,
+    normalize_arxiv_id,
+)
 from .retrieval import search as hybrid_search
 from .utils import truncate
 
@@ -97,7 +104,7 @@ def get_paper_summary(paper_id: int) -> str:
 @tool
 def get_innovations(paper_id: int) -> str:
     """获取某篇论文已抽取的创新点列表。生成新研究想法前调用，收集组合素材。"""
-    items = get_innovations(paper_id)
+    items = db_get_innovations(paper_id)
     return _limit({"ok": True, "count": len(items), "innovations": items})
 
 
@@ -136,8 +143,6 @@ def find_github_url(paper_id: int) -> str:
     try:
         query = re.sub(r"[^\w\s-]", " ", paper["title"])[:80]
         headers = {}
-        import os
-
         if os.environ.get("GITHUB_TOKEN"):
             headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
         resp = requests.get(
@@ -176,10 +181,10 @@ def analyze_github_repo(url: str) -> str:
             capture_output=True,
             text=True,
             timeout=300,
+            check=False,  # 自行检查 returncode，克隆失败返回友好错误而非抛异常
         )
         if proc.returncode != 0:
             return _error(f"克隆失败：{(proc.stderr or '').strip()[-500:]}")
-
 
         repo = Path(tmpdir)
         readme = _find_readme(repo)

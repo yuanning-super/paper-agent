@@ -113,7 +113,7 @@ def extract_node(state: InnovateState) -> dict:
             )
             data, _ = complete_json(
                 prompt,
-                validator=lambda d: _validate_innovation_list(d, valid_ids),
+                validator=lambda d, ids=valid_ids: _validate_innovation_list(d, ids),
             )
             if data is None:
                 events.append(f"《{paper['title'][:40]}》创新点抽取失败（重试后仍无法解析）")
@@ -153,7 +153,7 @@ def generate_node(state: InnovateState) -> dict:
         prompt = IDEAS_GENERATE_PROMPT.format(innovations=listing[:20_000])
         data, _ = complete_json(
             prompt,
-            validator=lambda d: _validate_idea_list(d, valid_ids),
+            validator=lambda d, ids=valid_ids: _validate_idea_list(d, ids),
             max_tokens=6000,
         )
         if data is None:

@@ -6,7 +6,6 @@ import logging
 
 import numpy as np
 
-from .config import load_settings
 from .db import set_meta
 
 logger = logging.getLogger("paper_agent")
@@ -16,7 +15,11 @@ class Embedder:
     """懒加载单例。加载失败时 available=False，检索自动降级纯 BM25。"""
 
     def __init__(self, model_name: str | None = None):
-        self.model_name = model_name or load_settings().embed_model
+        if model_name is None:
+            from .rag.config import load_rag_config  # 延迟导入避免启动开销
+
+            model_name = load_rag_config().embedding.model
+        self.model_name = model_name
         self._model = None
         self._available: bool | None = None  # None = 未尝试加载
 

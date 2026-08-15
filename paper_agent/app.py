@@ -11,7 +11,7 @@ from pathlib import Path
 import streamlit as st
 
 from .config import load_settings
-from .db import get_chunks, get_innovations, get_paper, init_db, list_ideas, list_papers
+from .db import get_chunks, get_innovations, init_db, list_ideas, list_papers
 from .embed import get_embedder
 from .graphs import build_interpret_graph, run_extract, run_ideas
 from .graphs.qa_graph import build_qa_graph

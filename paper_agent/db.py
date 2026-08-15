@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from typing import Any
 
 from .config import load_settings
 
@@ -253,17 +252,6 @@ def get_innovations(paper_id: int) -> list[dict]:
     return [_innov_row_to_dict(r) for r in rows]
 
 
-def get_innovations_by_ids(ids: list[int]) -> list[dict]:
-    if not ids:
-        return []
-    marks = ",".join("?" * len(ids))
-    with get_conn() as conn:
-        rows = conn.execute(
-            f"SELECT * FROM innovations WHERE id IN ({marks}) ORDER BY id", ids
-        ).fetchall()
-    return [_innov_row_to_dict(r) for r in rows]
-
-
 def _innov_row_to_dict(row: sqlite3.Row) -> dict:
     d = dict(row)
     try:
@@ -277,7 +265,7 @@ def _innov_row_to_dict(row: sqlite3.Row) -> dict:
 
 def save_ideas(items: list[dict]) -> list[int]:
     with get_conn() as conn:
-        cur = conn.executemany(
+        conn.executemany(
             """INSERT INTO ideas
                (title, hypothesis, combination, source_innovations, source_papers,
                 feasibility, risks, experiments, raw_json)

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Iterator
+from collections.abc import Callable
+from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -46,27 +47,6 @@ def complete(
     messages.append(HumanMessage(content=prompt))
     resp = get_llm(max_tokens=max_tokens, temperature=temperature).invoke(messages)
     return resp.content if isinstance(resp.content, str) else str(resp.content)
-
-
-def stream(
-    prompt: str,
-    system: str | None = None,
-    max_tokens: int | None = None,
-    temperature: float | None = None,
-) -> Iterator[str]:
-    """流式文本生成，逐 token 产出。"""
-    messages = []
-    if system:
-        messages.append(SystemMessage(content=system))
-    messages.append(HumanMessage(content=prompt))
-    for chunk in get_llm(max_tokens=max_tokens, temperature=temperature).stream(messages):
-        content = chunk.content
-        if isinstance(content, str) and content:
-            yield content
-        elif isinstance(content, list):  # 某些版本 content 为块列表
-            for b in content:
-                if isinstance(b, dict) and b.get("text"):
-                    yield b["text"]
 
 
 def complete_json(

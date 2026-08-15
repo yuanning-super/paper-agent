@@ -130,7 +130,7 @@ def rag_status() -> str:
 def main() -> None:
     mcp_cfg = load_rag_config().mcp
     if mcp_cfg.transport == "sse":
-        mcp.run(transport="sse")
+        mcp.run(transport="sse", host=mcp_cfg.host, port=mcp_cfg.port)
     else:
         mcp.run()  # stdio
 

@@ -44,7 +44,7 @@ def run(skip_llm: bool) -> int:
         os.environ["PAPER_AGENT_SKIP_LLM"] = "1"
 
     from paper_agent.config import load_settings
-    from paper_agent.db import get_chunks, get_meta, get_paper, init_db, list_papers
+    from paper_agent.db import get_paper, init_db
     from paper_agent.graphs import run_ingest
     from paper_agent.retrieval import search
 
@@ -52,13 +52,16 @@ def run(skip_llm: bool) -> int:
     settings = load_settings()
     for f in settings.data_dir.glob("library.db*"):
         f.unlink()
+    import shutil
+
     from paper_agent.rag.config import load_rag_config
 
     milvus_uri = load_rag_config().milvus.resolved_uri()
     milvus_path = Path(milvus_uri)
     if not milvus_uri.startswith(("http://", "https://")):
+        # milvus-lite 3.x 以目录形式存储（LOCK/collections/…），需递归删除
         for f in milvus_path.parent.glob(milvus_path.name + "*"):
-            f.unlink()
+            shutil.rmtree(f) if f.is_dir() else f.unlink()
     init_db()
     failed = 0
     results: dict[str, int] = {}
@@ -216,8 +219,10 @@ def run(skip_llm: bool) -> int:
         rag_index_missing,
         rag_list_papers,
         rag_search,
-        rag_status as _mcp_status,
         rag_update_paper,
+    )
+    from paper_agent.rag.mcp_server import (
+        rag_status as _mcp_status,
     )
 
     r = _mcp_status()

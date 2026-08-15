@@ -28,3 +28,8 @@ dependencies = [
     "sentence-transformers>=5.7.0",
     "streamlit>=1.61.1",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.3",
+]

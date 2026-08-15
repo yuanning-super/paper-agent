@@ -11,7 +11,7 @@ import logging
 import re
 from typing import TypedDict
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
 from ..config import load_settings
@@ -32,7 +32,7 @@ from ._compat import get_create_agent
 logger = logging.getLogger("paper_agent")
 
 PAPER_ID_RE = re.compile(r"#\s*(\d+)|论文\s*ID[：:\s]*(\d+)|paper_id[：:\s]*(\d+)")
-ARXIV_ID_RE = re.compile(r"(?:arxiv:)?(\d{4}\.\d{4,5})", re.I)
+ARXIV_ID_RE = re.compile(r"(?:arxiv:)?(\d{4}\.\d{4,5})", re.IGNORECASE)
 
 REPORT_SECTIONS = [
     "## 1. 背景与动机",
@@ -58,7 +58,7 @@ class InterpretState(TypedDict, total=False):
 
 # ---------- 阶段一：探索 agent ----------
 
-def _build_explorer(checkpointer=None):
+def _build_explorer():
     create_agent = get_create_agent()
     return create_agent(
         model=get_llm(),
@@ -71,7 +71,6 @@ def _build_explorer(checkpointer=None):
             get_paper_summary,
         ],
         system_prompt=INTERPRET_AGENT_SYSTEM,
-        checkpointer=checkpointer,
     )
 
 

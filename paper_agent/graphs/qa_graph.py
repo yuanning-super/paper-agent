@@ -24,7 +24,6 @@ logger = logging.getLogger("paper_agent")
 
 MAX_PAPERS = 3  # 引用来源最多去重到 3 篇
 SNIPPET_LIMIT = 500  # 每片段字符数
-MAX_FOLLOWUP_ROUNDS = 2  # agent 追问检索的最大工具轮数（由 agent 自身决定，这里仅限流）
 
 
 class QAState(TypedDict, total=False):
