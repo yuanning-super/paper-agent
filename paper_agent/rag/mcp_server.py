@@ -1,4 +1,4 @@
-"""RAG MCP 工具服务器（FastMCP）。
+"""RAG MCP 工具服务器（mcp SDK 2.x / MCPServer）。
 
 把论文库 RAG 能力暴露为 MCP 工具：检索、入库、增量更新、删除、状态。
 
@@ -14,7 +14,7 @@ import json
 import logging
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from ..db import find_paper_by_arxiv_id, list_papers
 from ..graphs import run_ingest
@@ -33,8 +33,9 @@ from .retriever import search
 logger = logging.getLogger("paper_agent")
 
 _cfg = load_rag_config()
-mcp = FastMCP(
+mcp = MCPServer(
     name=_cfg.mcp.name,
+    version="0.1.0",
     instructions=(
         "论文库 RAG 工具：基于 Milvus 向量库 + BM25 的混合检索，"
         "支持论文入库（自动解析/分块/建索引）、增量更新与删除。"
