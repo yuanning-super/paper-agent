@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import logging
+import shutil
 
+from ..config import load_settings
 from ..db import get_chunks, get_conn, get_meta_int, get_paper, list_papers, set_meta
 from .config import load_rag_config
 from .embedding import get_embedder
@@ -120,12 +122,13 @@ def delete_paper_vectors(paper_id: int) -> dict:
 
 
 def remove_paper(paper_id: int) -> dict:
-    """完整删除论文：Milvus 向量 + SQLite 元数据（级联清理分块/创新点）。"""
+    """完整删除论文：Milvus 向量 + SQLite 元数据（级联清理分块/创新点）+ 论文工作区。"""
     vectors = delete_paper_vectors(paper_id)
     paper = get_paper(paper_id)
     if paper:
         with get_conn() as conn:
             conn.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
+    shutil.rmtree(load_settings().workspaces_dir / str(paper_id), ignore_errors=True)
     _bump_version()
     return {
         "ok": True,

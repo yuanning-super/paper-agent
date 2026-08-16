@@ -43,6 +43,9 @@ class Settings:
     clones_dir: Path = field(default_factory=lambda: DATA_DIR / "clones")
     checkpoints_dir: Path = field(default_factory=lambda: DATA_DIR / "checkpoints")
     figures_dir: Path = field(default_factory=lambda: DATA_DIR / "figures")
+    # 每篇论文的独立工作区：workspaces/{id}/ 下放代码克隆（repo/）、原文图表（figures/）、
+    # 最终报告（report.md）与各阶段结果（background/method/experiment.md）
+    workspaces_dir: Path = field(default_factory=lambda: DATA_DIR / "workspaces")
 
     # LLM（DeepSeek 原生 OpenAI 兼容接口）
     model: str = _deepseek_model()
@@ -68,6 +71,7 @@ class Settings:
             self.clones_dir,
             self.checkpoints_dir,
             self.figures_dir,
+            self.workspaces_dir,
         ):
             p.mkdir(parents=True, exist_ok=True)
 

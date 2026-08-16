@@ -147,6 +147,16 @@ def find_paper_by_arxiv_id(arxiv_id: str) -> dict | None:
     return _paper_row_to_dict(row) if row else None
 
 
+def find_paper_by_github_url(url: str) -> dict | None:
+    """按 GitHub 仓库地址反查论文（容忍存储时的尾部差异）。"""
+    url = url.strip().rstrip("/")
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM papers WHERE github_url LIKE ?", (f"{url}%",)
+        ).fetchone()
+    return _paper_row_to_dict(row) if row else None
+
+
 def list_papers(status: str | None = None) -> list[dict]:
     sql = "SELECT * FROM papers"
     args: tuple = ()

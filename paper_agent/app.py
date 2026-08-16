@@ -30,7 +30,7 @@ app = FastAPI(title="科研论文管理 Agent")
 
 # 静态资源：KaTeX（本地托管，离线可用）与论文图表
 app.mount("/static", StaticFiles(directory=Path(__file__).resolve().parent / "static"), name="static")
-app.mount("/figures", StaticFiles(directory=load_settings().figures_dir), name="figures")
+app.mount("/workspaces", StaticFiles(directory=load_settings().workspaces_dir), name="workspaces")
 
 
 def _sse(payload: dict) -> str:
@@ -121,10 +121,10 @@ def paper_report(paper_id: int) -> JSONResponse:
     if not paper or not paper.get("report_path"):
         return JSONResponse({"error": "报告不存在，请先解读"}, status_code=404)
     text = Path(paper["report_path"]).read_text(encoding="utf-8")
-    # 各阶段子报告（与最终报告一并保存）
+    # 各阶段子报告（保存在论文工作区，与最终报告一并落盘）
     steps = {}
     for key, label in (("background", "背景调研"), ("method", "方法分析"), ("experiment", "实验分析")):
-        p = load_settings().reports_dir / f"{paper_id}.{key}.md"
+        p = load_settings().workspaces_dir / str(paper_id) / f"{key}.md"
         if p.exists():
             steps[label] = p.read_text(encoding="utf-8")
     return JSONResponse({"paper_id": paper_id, "report": text, "steps": steps})
@@ -198,14 +198,14 @@ def qa(req: QARequest) -> JSONResponse:
 
 @app.get("/api/papers/{paper_id}/figures")
 def paper_figures(paper_id: int) -> JSONResponse:
-    """论文提取出的原文图表列表。"""
+    """论文提取出的原文图表列表（保存在论文工作区）。"""
     settings = load_settings()
-    out_dir = settings.figures_dir / str(paper_id)
+    out_dir = settings.workspaces_dir / str(paper_id) / "figures"
     if not out_dir.exists():
         return JSONResponse([])
     return JSONResponse(
         [
-            {"name": f.name, "url": f"/figures/{paper_id}/{f.name}", "page": f.name.split("_p")[-1].split(".")[0]}
+            {"name": f.name, "url": f"/workspaces/{paper_id}/figures/{f.name}", "page": f.name.split("_p")[-1].split(".")[0]}
             for f in sorted(out_dir.glob("*.png"))
         ]
     )
@@ -231,7 +231,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <title>科研论文管理 Agent</title>
 <link rel="stylesheet" href="/static/katex/katex.min.css">
 <script defer src="/static/katex/katex.min.js"></script>
-<script defer src="/static/katex/contrib/auto-render.min.js"></script>
+<script defer src="/static/katex/auto-render.min.js"></script>
 <style>
   :root {
     --bg: #070b14; --bg2: #0c1322; --card: rgba(148, 180, 255, 0.045);
@@ -342,6 +342,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .md p { margin: 8px 0; }
   .md ul, .md ol { padding-left: 26px; margin: 8px 0; }
   .md li { margin: 4px 0; }
+  .md .math-block { overflow-x: auto; padding: 6px 0; }
   .md code { background: rgba(34, 211, 238, 0.09); border: 1px solid rgba(34,211,238,.15);
           border-radius: 5px; padding: 1.5px 7px; font-size: 12.3px; color: #9beaf7;
           font-family: ui-monospace, "SF Mono", Menlo, monospace; }
@@ -545,7 +546,8 @@ function renderMathInto(el) {
     try { renderMathInElement(el, {delimiters: [
       {left: '\\(', right: '\\)', display: false},
       {left: '\\[', right: '\\]', display: true},
-      {left: '$$', right: '$$', display: true}], throwOnError: false}); } catch (e) {}
+      {left: '$$', right: '$$', display: true},
+      {left: '$', right: '$', display: false}], throwOnError: false}); } catch (e) {}
   }
 }
 
@@ -659,7 +661,7 @@ async function viewReport(id) {
 }
 
 async function delPaper(id) {
-  if (!confirm('确认删除论文 #' + id + '？将同时删除 Milvus 索引与库内元数据。')) return;
+  if (!confirm('确认删除论文 #' + id + '？将同时删除 Milvus 索引、库内元数据与论文工作区。')) return;
   await fetch('/api/papers/' + id, {method: 'DELETE'});
   loadPapers();
 }
@@ -686,7 +688,7 @@ const pickedIds = () => [...document.querySelectorAll('#paper-picks input:checke
 
 async function runExtract() {
   const ids = pickedIds(); if (!ids.length) return;
-  $('innov-status').textContent = '<span class="spinner"></span>抽取创新点中…（通常需要几分钟）';
+  $('innov-status').innerHTML = '<span class="spinner"></span>抽取创新点中…（通常需要几分钟）';
   const r = await fetch('/api/innovations/extract', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({paper_ids: ids})}).then(j);
   $('innov-status').innerHTML = (r.events || []).map(esc).join('<br>') || esc(r.error || '完成');
   loadPicks();
@@ -746,9 +748,11 @@ async function runQA() {
 /* ---------- 迷你 Markdown 渲染 ---------- */
 function renderMarkdown(src) {
   let s = esc(src);
-  // 代码块
-  s = s.replace(/```(\w*)\n?([\s\S]*?)```/g, (m, lang, code) => '<pre><code>' + code.replace(/\n$/, '') + '</code></pre>');
-  // 表格
+  const blocks = [];
+  const stash = html => { blocks.push(html); return '\u0000' + (blocks.length - 1) + '\u0000'; };
+  // 数学块 / 代码块 / 表格先占位，避免被后续段落处理拆散
+  s = s.replace(/\$\$([\s\S]*?)\$\$/g, (m, tex) => stash('<div class="math-block">$$' + tex + '$$</div>'));
+  s = s.replace(/```(\w*)\n?([\s\S]*?)```/g, (m, lang, code) => stash('<pre><code>' + code.replace(/\n$/, '') + '</code></pre>'));
   s = s.replace(/((?:^\|.+\|\n)+)(?=\n|$)/gm, block => {
     const rows = block.trim().split('\n').filter(r => /\|/.test(r));
     const toCells = r => r.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
@@ -756,7 +760,7 @@ function renderMarkdown(src) {
     const head = toCells(rows[0]).map(c => '<th>' + c + '</th>').join('');
     const body = rows.slice(1).filter(r => !isSep(r))
       .map(r => '<tr>' + toCells(r).map(c => '<td>' + c + '</td>').join('') + '</tr>').join('');
-    return '<table><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table>';
+    return stash('<table><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table>');
   });
   // 标题
   s = s.replace(/^#### (.*)$/gm, '<h4>$1</h4>');
@@ -774,12 +778,12 @@ function renderMarkdown(src) {
   s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
   s = s.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
   s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-  // 段落
+  // 段落（占位符与块级标签所在行不再包裹）
   s = s.replace(/\n{2,}/g, '\n');
   s = s.split('\n').map(line =>
-    /^<(h\d|ul|ol|table|pre|blockquote|hr)/.test(line) ? line : '<p>' + line + '</p>'
+    /^<(h\d|ul|ol|table|pre|blockquote|hr)/.test(line) || /^\u0000\d+\u0000$/.test(line) ? line : '<p>' + line + '</p>'
   ).join('\n');
-  return s;
+  return s.replace(/\u0000(\d+)\u0000/g, (m, i) => blocks[+i]);
 }
 
 loadPapers(); loadPicks(); loadIdeas();

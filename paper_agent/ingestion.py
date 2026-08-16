@@ -163,7 +163,7 @@ def extract_figures(pdf_path: Path, paper_id: int) -> list[dict]:
     import fitz  # PyMuPDF
 
     settings = load_settings()
-    out_dir = settings.figures_dir / str(paper_id)
+    out_dir = settings.workspaces_dir / str(paper_id) / "figures"
     out_dir.mkdir(parents=True, exist_ok=True)
     figures: list[dict] = []
     seen_xref: set[int] = set()

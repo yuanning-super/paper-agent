@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic",
+    "duckduckgo-search>=8.1.1",
     "fastapi>=0.141.1",
     "langchain>=1.3.15",
     "langchain-anthropic>=1.5.6",

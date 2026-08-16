@@ -38,11 +38,14 @@ from ..tools import (
     arxiv_fetch_metadata,
     find_github_url,
     get_paper_summary,
+    grep_repo,
     ingest_arxiv_paper,
+    list_repo_dir,
     read_repo_file,
     read_section,
     search_library,
     set_section_cache,
+    web_search,
 )
 from ..utils import truncate
 from ._compat import get_create_agent
@@ -205,7 +208,7 @@ def background_node(state: InterpretState) -> dict:
             references=_join_role(sections, "references", 6000),
         )
         out = _run_subagent(
-            BACKGROUND_AGENT_SYSTEM, user, [read_section, search_library, get_paper_summary]
+            BACKGROUND_AGENT_SYSTEM, user, [read_section, search_library, get_paper_summary, web_search]
         )
         return {"background": out, "events": ["✅ 背景调研完成（数据集与 baseline）"]}
     except Exception as e:  # noqa: BLE001 —— 并行节点失败不中断整体，写入输出字段由报告 agent 如实说明
@@ -225,7 +228,7 @@ def method_node(state: InterpretState) -> dict:
             repo_material=truncate(state.get("repo_material", ""), 8000, mode="head") or "（无）",
         )
         out = _run_subagent(
-            METHOD_AGENT_SYSTEM, user, [read_section, read_repo_file, search_library]
+            METHOD_AGENT_SYSTEM, user, [read_section, read_repo_file, grep_repo, list_repo_dir, search_library]
         )
         return {"method_analysis": out, "events": ["✅ 方法分析完成（创新性与实现）"]}
     except Exception as e:  # noqa: BLE001
@@ -268,18 +271,18 @@ def report_node(state: InterpretState) -> dict:
         )
         out = _run_subagent(REPORT_AGENT_SYSTEM, user, [read_section])
 
-        # 保存各阶段结果（与最终报告一并落盘，供回溯查阅）
+        # 各阶段结果与最终报告一并写入论文工作区（workspaces/{id}/）
+        ws = settings.workspaces_dir / str(state["paper_id"])
+        ws.mkdir(parents=True, exist_ok=True)
         step_names = {
             "background": ("背景调研", state.get("background", "")),
             "method": ("方法分析", state.get("method_analysis", "")),
             "experiment": ("实验分析", state.get("experiment_analysis", "")),
         }
         for key, (label, content) in step_names.items():
-            (settings.reports_dir / f"{state['paper_id']}.{key}.md").write_text(
-                f"# {label}\n\n{content}\n", encoding="utf-8"
-            )
+            (ws / f"{key}.md").write_text(f"# {label}\n\n{content}\n", encoding="utf-8")
 
-        report_path = settings.reports_dir / f"{state['paper_id']}.md"
+        report_path = ws / "report.md"
         report_path.write_text(
             f"# 论文解读：{paper.get('title', '')}\n\n{out}\n", encoding="utf-8"
         )

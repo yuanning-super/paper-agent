@@ -7,9 +7,7 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 import requests
@@ -166,7 +164,7 @@ def find_github_url(paper_id: int) -> str:
 
 @tool
 def analyze_github_repo(url: str) -> str:
-    """浅克隆 GitHub 仓库并分析：README 要点、目录结构、依赖清单、核心代码文件摘要。
+    """浅克隆 GitHub 仓库到论文工作区并分析：README 要点、目录结构、依赖清单、核心代码文件摘要。
     返回的结构化结果将作为解读报告"代码仓库分析"章节的素材。"""
     url = url.strip().rstrip("/")
     m = GITHUB_REPO_RE.search(url)
@@ -174,43 +172,27 @@ def analyze_github_repo(url: str) -> str:
         return _error(f"不是有效的 GitHub 仓库地址：{url}")
     clean_url = f"https://github.com/{m.group(1)}/{m.group(2)}"
 
-    settings = load_settings()
-    tmpdir = tempfile.mkdtemp(prefix="repo_", dir=settings.clones_dir)
     try:
-        proc = subprocess.run(
-            ["git", "clone", "--depth", "1", "--single-branch", clean_url, tmpdir],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=False,  # 自行检查 returncode，克隆失败返回友好错误而非抛异常
-        )
-        if proc.returncode != 0:
-            return _error(f"克隆失败：{(proc.stderr or '').strip()[-500:]}")
-
-        repo = Path(tmpdir)
+        repo = Path(_get_repo_clone(clean_url))
         readme = _find_readme(repo)
         tree = _dir_tree(repo, max_entries=40)
         deps = _extract_deps(repo)
         core = _core_files(repo)
         stats = _file_stats(repo)
-
-        return _limit(
-            {
-                "ok": True,
-                "url": clean_url,
-                "readme_excerpt": readme[:2000] if readme else "",
-                "tree": tree,
-                "deps": deps,
-                "core_files": core,
-                "stats": stats,
-            }
-        )
-    except subprocess.TimeoutExpired:
-        return _error("克隆超时（300 秒），仓库可能过大或网络较慢，可稍后重试")
     except Exception as e:  # noqa: BLE001
         return _error(f"仓库分析失败：{e}")
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return _limit(
+        {
+            "ok": True,
+            "url": clean_url,
+            "readme_excerpt": readme[:2000] if readme else "",
+            "tree": tree,
+            "deps": deps,
+            "core_files": core,
+            "stats": stats,
+        }
+    )
 
 
 # ---------- 解读专用：章节与仓库文件按需读取 ----------
@@ -247,11 +229,24 @@ def read_section(paper_id: int, index: int) -> str:
 _repo_cache: dict[str, str] = {}  # 仓库 url → 本地克隆目录（进程内复用）
 
 
+def _repo_dir(url: str) -> Path:
+    """论文代码统一放在论文自己的工作区（workspaces/{paper_id}/repo）；
+    未关联到论文的仓库退回共享克隆目录。"""
+    from .db import find_paper_by_github_url
+
+    settings = load_settings()
+    paper = find_paper_by_github_url(url)
+    if paper:
+        return settings.workspaces_dir / str(paper["id"]) / "repo"
+    return settings.clones_dir / "repos" / hashlib.sha1(url.encode()).hexdigest()[:12]
+
+
 def _get_repo_clone(url: str) -> str:
     if url in _repo_cache and Path(_repo_cache[url]).exists():
         return _repo_cache[url]
-    dest = load_settings().clones_dir / "repos" / hashlib.sha1(url.encode()).hexdigest()[:12]
+    dest = _repo_dir(url)
     if not dest.exists():
+        dest.parent.mkdir(parents=True, exist_ok=True)
         proc = subprocess.run(
             ["git", "clone", "--depth", "1", "--single-branch", url, str(dest)],
             capture_output=True,
@@ -266,16 +261,69 @@ def _get_repo_clone(url: str) -> str:
 
 
 @tool
-def read_repo_file(url: str, path: str) -> str:
+def read_repo_file(url: str, path: str, start_line: int = 1, max_lines: int = 200) -> str:
     """读取 GitHub 仓库中的指定文件（相对路径，如 csrc/flash_attn/fwd.cu）。
-    分析论文方法实现时按需查看代码；先用 analyze_github_repo 了解目录结构。"""
+    可用 start_line/max_lines 指定行范围，默认从头读 200 行。
+    先用 grep_repo 定位代码位置，再用本工具精读对应文件。"""
     try:
         repo = Path(_get_repo_clone(url))
         target = (repo / path).resolve()
         if not target.is_file() or not target.is_relative_to(repo.resolve()):
             return _error(f"文件不存在或路径非法：{path}")
-        text = "\n".join(target.read_text(encoding="utf-8", errors="ignore").splitlines()[:200])
-        return _limit({"ok": True, "path": path, "content": text})
+        lines = target.read_text(encoding="utf-8", errors="ignore").splitlines()
+        start = max(1, start_line) - 1
+        text = "\n".join(lines[start : start + max_lines])
+        return _limit({"ok": True, "path": path, "start_line": start + 1, "content": text})
+    except Exception as e:  # noqa: BLE001
+        return _error(f"读取失败：{e}")
+
+
+@tool
+def grep_repo(url: str, pattern: str, ignore_case: bool = True, max_matches: int = 30) -> str:
+    """在 GitHub 仓库代码中搜索（ripgrep 正则），返回「路径:行号 匹配行」列表。
+    定位类/函数定义、关键超参、调用位置时调用；命中后用 read_repo_file 精读对应文件。"""
+    try:
+        repo = Path(_get_repo_clone(url))
+        cmd = ["rg", "--line-number", "--no-heading", "--no-messages", "-m", str(max_matches)]
+        if ignore_case:
+            cmd.append("--ignore-case")
+        cmd += ["--", pattern, str(repo)]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+    except FileNotFoundError:
+        return _error("ripgrep（rg）未安装，请先安装：brew install ripgrep")
+    except subprocess.TimeoutExpired:
+        return _error("搜索超时（120 秒），可换更精确的 pattern 重试")
+    except Exception as e:  # noqa: BLE001
+        return _error(f"搜索失败：{e}")
+    if proc.returncode == 2:
+        return _error(f"搜索失败：{(proc.stderr or '').strip()[-300:]}")
+    matches = [ln.strip()[:200] for ln in proc.stdout.splitlines() if ln.strip()]
+    matches = matches[:max_matches]  # rg 的 -m 是每文件上限，这里再限总量
+    return _limit(
+        {
+            "ok": True,
+            "matches": matches,
+            "truncated": len(matches) >= max_matches,
+        }
+    )
+
+
+@tool
+def list_repo_dir(url: str, path: str = "") -> str:
+    """列出 GitHub 仓库中某目录的内容（path 为相对路径，留空列根目录），目录以 / 结尾。
+    浏览代码结构、定位实现文件位置时调用。"""
+    try:
+        repo = Path(_get_repo_clone(url))
+        target = (repo / path).resolve() if path else repo.resolve()
+        if not target.is_dir() or not target.is_relative_to(repo.resolve()):
+            return _error(f"目录不存在或路径非法：{path}")
+        entries = []
+        for p in sorted(target.iterdir()):
+            if p.name.startswith("."):
+                continue
+            rel = p.relative_to(repo)
+            entries.append(f"{rel}/" if p.is_dir() else str(rel))
+        return _limit({"ok": True, "path": path or "/", "entries": entries})
     except Exception as e:  # noqa: BLE001
         return _error(f"读取失败：{e}")
 
@@ -348,14 +396,37 @@ def _file_stats(repo: Path) -> dict:
     return {"total_files": sum(counter.values()), "by_extension": dict(counter.most_common(10))}
 
 
+# ---------- 联网搜索（背景调研） ----------
+
+@tool
+def web_search(query: str, max_results: int = 5) -> str:
+    """联网搜索（DuckDuckGo），返回标题/链接/摘要。
+    调研论文之外的外部信息（数据集、baseline 方法背景）时调用。"""
+    from duckduckgo_search import DDGS  # 延迟导入：首次联网搜索才加载
+
+    try:
+        with DDGS() as d:
+            results = list(d.text(keywords=query, max_results=max_results))
+    except Exception as e:  # noqa: BLE001
+        return _error(f"网络搜索失败：{e}")
+    items = [
+        {"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")[:300]}
+        for r in results
+    ]
+    return _limit({"ok": True, "count": len(items), "results": items})
+
+
 # ---------- 汇总 ----------
 
 TOOL_LIST = [
     arxiv_fetch_metadata,
     ingest_arxiv_paper,
     search_library,
+    web_search,
     find_github_url,
     analyze_github_repo,
+    grep_repo,
+    list_repo_dir,
     read_repo_file,
     read_section,
     get_innovations,
