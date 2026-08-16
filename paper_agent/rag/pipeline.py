@@ -14,8 +14,8 @@ from __future__ import annotations
 import logging
 
 from ..db import get_chunks, get_conn, get_meta_int, get_paper, list_papers, set_meta
-from ..embed import get_embedder
 from .config import load_rag_config
+from .embedding import get_embedder
 from .milvus_store import MilvusStore
 
 logger = logging.getLogger("paper_agent")
@@ -34,34 +34,35 @@ def _bump_version() -> None:
     set_meta("rag_index_version", str(get_meta_int("rag_index_version") + 1))
 
 
-def index_embedded_chunks(paper_id: int, chunks: list[dict], vecs) -> dict:
-    """把已嵌入好的分块写入 Milvus（入库流水线内复用已算向量，避免重复嵌入）。"""
+def index_embedded_chunks(paper_id: int, chunks: list[dict], vecs=None) -> dict:
+    """把分块写入 Milvus（BM25 倒排由 Milvus 自动生成；vecs 为 None 时不写稠密向量）。"""
     store = get_store()
     if not store.available:
         return {"ok": False, "error": "Milvus 不可用"}
     existing = store.count_by_paper(paper_id)
     if existing:
         store.delete_by_paper(paper_id)
-    rows = [
-        {
+    rows = []
+    for i, c in enumerate(chunks):
+        row = {
             "paper_id": paper_id,
             "seq": c["seq"],
             "heading": c.get("heading"),
             "content": c["content"],
-            "embedding": v,
         }
-        for c, v in zip(chunks, vecs)
-    ]
+        if vecs is not None:
+            row["embedding"] = vecs[i]
+        rows.append(row)
     n = store.insert_chunks(rows)
     _bump_version()
-    return {"ok": True, "indexed": n, "message": f"已写入 {n} 块向量索引"}
+    return {"ok": True, "indexed": n, "message": f"已写入 {n} 块 BM25 索引"}
 
 
 def index_paper(paper_id: int, force: bool = False) -> dict:
-    """解析（读 PDF/分块缓存）→ 分块 → 嵌入 → 写入 Milvus。
+    """解析（读 PDF/分块缓存）→ 分块 → 写入 Milvus（BM25 倒排，可选稠密向量）。
 
     force=False：增量语义，已在索引中则跳过；
-    force=True：更新语义，删除旧向量后重建该论文索引。
+    force=True：更新语义，删除旧索引后重建该论文。
     """
     store = get_store()
     if not store.available:
@@ -77,13 +78,11 @@ def index_paper(paper_id: int, force: bool = False) -> dict:
     if existing and not force:
         return {"ok": True, "indexed": 0, "message": f"论文已在索引中（{existing} 块），增量跳过"}
 
-    embedder = get_embedder()
-    if not embedder.available:
-        return {"ok": False, "error": "本地 embedding 模型不可用，无法建立向量索引"}
-
-    vecs = embedder.embed_many([c["content"] for c in chunks])
-    if vecs is None:
-        return {"ok": False, "error": "嵌入失败"}
+    vecs = None
+    if load_rag_config().embedding.enabled:
+        vecs = get_embedder().embed_many([c["content"] for c in chunks])
+        if vecs is None:
+            return {"ok": False, "error": "embedding 已启用但模型不可用，无法建立向量索引"}
 
     return index_embedded_chunks(paper_id, chunks, vecs)
 
@@ -97,10 +96,10 @@ def index_missing() -> dict:
     results = []
     total = 0
     for paper in list_papers():
-        if not get_chunks(paper["id"]):
+        chunks = get_chunks(paper["id"])
+        if not chunks:
             continue
-        n_chunks = len(get_chunks(paper["id"]))
-        if paper["id"] in indexed_ids and store.count_by_paper(paper["id"]) == n_chunks:
+        if paper["id"] in indexed_ids and store.count_by_paper(paper["id"]) == len(chunks):
             continue  # 已是最新
         r = index_paper(paper["id"], force=True)
         if r.get("ok"):
@@ -150,9 +149,10 @@ def status() -> dict:
         "milvus_uri": cfg.milvus.resolved_uri(),
         "milvus_available": store.available,
         "collection": cfg.milvus.collection,
-        "vector_count": store.count() if store.available else 0,
+        "chunk_count": store.count() if store.available else 0,
         "indexed_papers": len(store.paper_ids()) if store.available else 0,
         "total_papers": len(list_papers()),
+        "embedding_enabled": cfg.embedding.enabled,
         "embedding_model": cfg.embedding.model,
         "embedding_available": get_embedder().available,
         "chunk_size": cfg.chunking.size,

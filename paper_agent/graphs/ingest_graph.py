@@ -16,7 +16,6 @@ from ..db import (
     set_meta,
     update_paper,
 )
-from ..embed import get_embedder
 from ..ingestion import (
     IngestResult,
     chunk_text,
@@ -26,6 +25,7 @@ from ..ingestion import (
     fetch_arxiv_metadata,
     normalize_arxiv_id,
 )
+from ..rag.embedding import get_embedder
 
 
 class IngestState(TypedDict, total=False):
@@ -121,48 +121,27 @@ def chunk_node(state: IngestState) -> dict:
 
 
 def embed_node(state: IngestState) -> dict:
-    embedder = get_embedder()
-    if not embedder.available:
-        return {"events": ["embedding 模型不可用，跳过向量化（检索将用纯 BM25）"]}
     chunks = get_chunks(state["paper_id"])
-    vecs = embedder.embed_many([c["content"] for c in chunks])
-    if vecs is None:
-        return {"events": ["embedding 失败，跳过向量化（检索将用纯 BM25）"]}
-    for c, v in zip(chunks, vecs):
-        c["embedding"] = v.tobytes()
-    from ..db import Chunk
-
-    replace_chunks(
-        state["paper_id"],
-        [
-            Chunk(
-                paper_id=state["paper_id"],
-                seq=c["seq"],
-                heading=c["heading"],
-                content=c["content"],
-                embedding=c["embedding"],
-            )
-            for c in chunks
-        ],
-    )
-    update_paper(state["paper_id"], status="embedded")
-
-    # 写入 Milvus 向量索引（复用已算向量；Milvus 不可用则降级纯 BM25，不阻塞入库）
+    # embedding 启用时计算稠密向量，否则仅建 BM25 倒排索引
+    vecs = None
+    embedder = get_embedder()
+    if embedder.available:
+        vecs = embedder.embed_many([c["content"] for c in chunks])
     from ..rag.pipeline import index_embedded_chunks
 
     r = index_embedded_chunks(state["paper_id"], chunks, vecs)
+    update_paper(state["paper_id"], status="embedded")
     if r.get("ok"):
-        return {"status": "embedded", "events": [f"向量嵌入完成，已写入 Milvus 索引（{r['indexed']} 块）"]}
-    return {"status": "embedded", "events": [f"向量嵌入完成；Milvus 索引失败（{r.get('error')}），检索将降级纯 BM25"]}
+        mode = "BM25+向量" if vecs is not None else "BM25 倒排"
+        return {"status": "embedded", "events": [f"已写入 Milvus 索引（{mode}，{r['indexed']} 块）"]}
+    return {"status": "embedded", "events": [f"Milvus 索引失败（{r.get('error')}），检索暂不可用"]}
 
 
 def enrich_node(state: IngestState) -> dict:
-    try:
-        if enrich_metadata(state["paper_id"]):
-            return {"events": ["元数据增强完成（中文标题/关键词/分类）"]}
-        return {"events": ["元数据增强未执行（无摘要或 LLM 调用失败）"]}
-    except Exception as e:  # noqa: BLE001 —— 增强失败不阻塞入库
-        return {"events": [f"元数据增强失败（{e}），保留原始元数据"]}
+    # enrich_metadata 内部自行兜底（失败仅告警、不抛异常）
+    if enrich_metadata(state["paper_id"]):
+        return {"events": ["元数据增强完成（中文标题/关键词/分类）"]}
+    return {"events": ["元数据增强未执行（无摘要或 LLM 调用失败）"]}
 
 
 def index_node(state: IngestState) -> dict:

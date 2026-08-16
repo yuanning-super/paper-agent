@@ -42,6 +42,7 @@ class Settings:
     cache_dir: Path = field(default_factory=lambda: DATA_DIR / "cache")
     clones_dir: Path = field(default_factory=lambda: DATA_DIR / "clones")
     checkpoints_dir: Path = field(default_factory=lambda: DATA_DIR / "checkpoints")
+    figures_dir: Path = field(default_factory=lambda: DATA_DIR / "figures")
 
     # LLM（DeepSeek 原生 OpenAI 兼容接口）
     model: str = _deepseek_model()
@@ -66,6 +67,7 @@ class Settings:
             self.cache_dir,
             self.clones_dir,
             self.checkpoints_dir,
+            self.figures_dir,
         ):
             p.mkdir(parents=True, exist_ok=True)
 

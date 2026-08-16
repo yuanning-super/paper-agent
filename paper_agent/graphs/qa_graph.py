@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TypedDict
+import operator
+from typing import Annotated, TypedDict
 
+from langgraph.config import get_config
 from langgraph.graph import END, START, StateGraph
 
 from ..db import log_qa
@@ -33,13 +35,14 @@ class QAState(TypedDict, total=False):
     answer: str
     citations: list[dict]
     error: str
+    events: Annotated[list[str], operator.add]
 
 
 def retrieve_node(state: QAState) -> dict:
     try:
         hits = search(state["question"], top_k=6)
         if not hits:
-            return {"hits": [], "context": ""}
+            return {"hits": [], "context": "", "events": ["检索完成：论文库中没有相关内容"]}
         # 去重到 ≤3 篇论文，保持得分序
         seen_papers: set[int] = set()
         selected = []
@@ -57,6 +60,7 @@ def retrieve_node(state: QAState) -> dict:
         return {
             "hits": [h.to_dict() for h in selected],
             "context": "\n\n".join(snippets),
+            "events": [f"检索完成：命中 {len(selected)} 篇论文的相关片段"],
         }
     except Exception as e:  # noqa: BLE001
         return {"error": f"检索失败：{e}"}
@@ -79,7 +83,7 @@ def answer_node(state: QAState) -> dict:
         answerer = _build_answerer()
         result = answerer.invoke(
             {"messages": [("user", prompt)]},
-            config={"recursion_limit": 25},
+            config={**get_config(), "recursion_limit": 25},
         )
         answer = ""
         for msg in reversed(result.get("messages", [])):
@@ -91,7 +95,7 @@ def answer_node(state: QAState) -> dict:
         citations = _collect_citations(result.get("messages", [])) or state.get("hits", [])
 
         log_qa(state["question"], answer, citations)
-        return {"answer": answer, "citations": citations}
+        return {"answer": answer, "citations": citations, "events": ["回答生成完成"]}
     except Exception as e:  # noqa: BLE001
         return {"error": f"回答生成失败：{e}"}
 

@@ -8,9 +8,9 @@
 
 ## 功能
 
-1. **论文解读报告**：上传 PDF 或输入 arXiv ID → 自动入库 → 生成中文解读报告（背景与动机 / 核心贡献 / 方法与技术细节 / 实验结果 / 局限与不足 / 相关工作对比 / **代码仓库分析** / 一句话总结）；找到论文的 GitHub 仓库时自动浅克隆分析（README、目录结构、依赖、核心代码）
+1. **论文解读报告**：上传 PDF 或输入 arXiv ID → 自动入库 → 按章节拆分论文（节省上下文）→ **强制委派四个子 agent**：背景调研（数据集与 baseline）、方法分析（创新性与实现，可读官方代码）、实验分析、报告综合 → 输出 6 章节中文报告（一句话总结 / **直观方法介绍（一眼看懂）** / 方法深度分析 / 实验背景 / 实验结果与分析 / 代码仓库分析）；自动查找并浅克隆分析论文的 GitHub 仓库
 2. **创新点抽取与推荐**：从论文抽取结构化创新点（方法 / 动机 / 发现 / 设计 / 数据），跨论文组合生成 3-5 个新研究想法（含可行性分析、风险、实验设计建议）
-3. **论文库整理与检索问答**：元数据入库、中文关键词与研究方向自动分类、去重；混合检索（Milvus 向量 + jieba BM25）问答，回答带引用来源；支持**增量更新**与**删除**操作
+3. **论文库整理与检索问答**：元数据入库、中文关键词与研究方向自动分类、去重；检索基于 **Milvus BM25 倒排索引**（启用 embedding 时与稠密向量做 RRF 混合融合），回答带引用来源；支持**增量更新**与**删除**操作
 
 ## RAG（Milvus + MCP）
 
@@ -19,9 +19,9 @@
 | 文件 | 职责 |
 |---|---|
 | `configs/rag.yaml` | RAG 全部配置（Milvus 地址/集合、embedding 模型、分块与检索参数、MCP 服务器） |
-| `rag/milvus_store.py` | Milvus 封装：本地 Lite 模式（文件，零依赖）或服务器模式（URI 可配） |
+| `rag/milvus_store.py` | Milvus 封装：BM25 倒排索引（原生稀疏向量）+ 可选稠密向量；本地 Lite 或服务器模式（URI 可配） |
 | `rag/pipeline.py` | 解析/分块/建索引流水线：`index_paper`（增量）、`index_missing`（批量增量）、`remove_paper`（删除） |
-| `rag/retriever.py` | 混合检索：Milvus 向量 + BM25 融合，Milvus 不可用自动降级纯 BM25 |
+| `rag/retriever.py` | 检索：Milvus BM25 倒排；embedding 启用时与稠密向量 RRF 融合 |
 | `rag/mcp_server.py` | MCP 工具服务器：`rag_search` / `rag_add_paper` / `rag_update_paper` / `rag_delete_paper` / `rag_index_missing` / `rag_list_papers` / `rag_status` |
 
 **注册到 Claude Code：**
@@ -54,10 +54,10 @@ cp .env.example .env
 uv run python scripts/download_embed.py
 
 # 启动 Web 界面
-uv run streamlit run paper_agent/app.py
+uv run python paper_agent/app.py   # 或 uv run uvicorn paper_agent.app:app --port 8501
 ```
 
-浏览器打开 http://localhost:8501，左侧导航五个页面：论文解读 / 论文库 / 创新点 / 研究想法 / 问答检索。
+浏览器打开 http://127.0.0.1:8501，四个页面：论文解读 / 论文库 / 创新工坊 / 问答。同时提供 REST API（/api/*，见 paper_agent/app.py）。
 
 ## 环境变量（.env）
 
@@ -96,18 +96,19 @@ paper_agent/
 ├── llm.py          # ChatOpenAI 封装（DeepSeek）+ JSON 修复重试
 ├── ingestion.py    # arXiv 抓取 / PDF 提取 / 分块 / 元数据增强
 ├── retrieval.py    # 检索入口（委托 rag 模块）
-├── embed.py        # bge-small-zh-v1.5 本地 embedding（懒加载）
 ├── tools.py        # agent 工具集（arXiv / GitHub / 论文库）
 ├── prompts.py      # 中文 prompt 模板
-├── rag/            # RAG 模块（Milvus 向量库 + MCP 服务器）
+├── rag/            # RAG 模块（自包含：分块/嵌入/Milvus 索引/检索/MCP）
 │   ├── config.py        # rag.yaml 加载器
+│   ├── chunking.py      # 文档分块（字符窗口 + 章节标题标注）
+│   ├── embedding.py     # bge-small-zh-v1.5 本地 embedding（懒加载，不可用降级）
 │   ├── milvus_store.py  # Milvus 连接/集合/增删查/向量检索
-│   ├── pipeline.py      # 解析→分块→嵌入→建索引（增量/更新/删除/迁移）
+│   ├── pipeline.py      # 分块→嵌入→建索引（增量/更新/删除/迁移）
 │   ├── retriever.py     # Milvus 向量 + BM25 混合检索（自动降级）
-│   └── mcp_server.py    # MCP 工具服务器（FastMCP）
+│   └── mcp_server.py    # MCP 工具服务器（mcp SDK MCPServer）
 ├── graphs/         # LangGraph 工作流
 │   ├── ingest_graph.py     # 入库工作流（含写入 Milvus）
-│   ├── interpret_graph.py  # 解读：agent loop 探索 + 报告生成
+│   ├── interpret_graph.py  # 解读：章节拆分 + 强制委派四个子 agent
 │   ├── innovate_graph.py   # 创新点抽取 + 想法生成
 │   └── qa_graph.py         # 检索 + 问答（agent 可追问检索）
 └── app.py          # Streamlit 界面
@@ -123,7 +124,7 @@ uv run python scripts/e2e.py --skip-llm # 只跑入库/检索/去重等离线步
 ## 说明
 
 - LLM 走 `.env` 中配置的 DeepSeek 原生 OpenAI 兼容接口（langchain-openai），支持工具调用与流式输出
-- 本地 embedding 模型（bge-small-zh-v1.5）首次运行自动下载，离线时自动降级为纯 BM25 检索
+- **本地向量默认关闭**（`configs/rag.yaml` 的 `embedding.enabled: false`）：检索为 Milvus BM25 倒排索引，零模型依赖。需要语义检索时设为 `true` 并运行 `uv run python scripts/download_embed.py` 预下载 bge-small-zh-v1.5（约 100MB）
 - embedding 模型不可用（离线/未下载）时自动降级为纯 BM25 检索
 - 扫描版 PDF 无法提取文本时会明确提示，不会产生空报告
 - 重复入库自动去重（按 arXiv ID；上传 PDF 按标题）

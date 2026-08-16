@@ -20,14 +20,12 @@ ARXIV_NO_REPO = "1706.03762"  # Attention Is All You Need（无官方仓库）
 ARXIV_WITH_REPO = "2205.14135"  # FlashAttention-2（有官方 GitHub 仓库）
 
 REPORT_SECTIONS = [
-    "背景与动机",
-    "核心贡献",
-    "方法与技术细节",
-    "实验结果",
-    "局限与不足",
-    "相关工作对比",
-    "代码仓库分析",
     "一句话总结",
+    "直观方法介绍",
+    "方法深度分析",
+    "实验背景",
+    "实验结果与分析",
+    "代码仓库分析",
 ]
 
 
@@ -79,14 +77,14 @@ def run(skip_llm: bool) -> int:
     failed += not check("入库成功（papers=1, chunks>0, status=enriched）", ok, f"paper_id={r1.paper_id}, chunks={r1.chunk_count}, error={r1.error}")
     results["paper1"] = r1.paper_id or 0
 
-    # 向量索引已写入 Milvus
+    # Milvus BM25 倒排索引已建立
     from paper_agent.rag.pipeline import status as rag_status
 
     st = rag_status()
     failed += not check(
-        "Milvus 向量索引已建立",
-        st.get("milvus_available") and st.get("vector_count", 0) > 0,
-        f"milvus={st.get('milvus_available')}, vectors={st.get('vector_count')}",
+        "Milvus BM25 索引已建立",
+        st.get("milvus_available") and st.get("chunk_count", 0) > 0,
+        f"milvus={st.get('milvus_available')}, chunks={st.get('chunk_count')}",
     )
 
     # ---------- 2. 重复入库去重 ----------
@@ -128,7 +126,7 @@ def run(skip_llm: bool) -> int:
     else:
         report_text = state.get("report_text", "")
         missing = [s for s in REPORT_SECTIONS if s not in report_text]
-        failed += not check("报告包含全部 8 个章节", not missing, f"缺失：{missing}")
+        failed += not check("报告包含全部 6 个章节", not missing, f"缺失：{missing}")
         p1 = get_paper(results["paper1"])
         failed += not check(
             "报告已落盘且状态更新为 interpreted",
@@ -171,14 +169,14 @@ def run(skip_llm: bool) -> int:
         ok = bool(saved_ideas)
         failed += not check("想法已持久化", ok, f"ideas 表 {len(saved_ideas)} 条")
 
-    # ---------- 8. 混合检索 ----------
-    print("\n=== 8. 混合检索 ===")
-    hits = search("自注意力机制", top_k=3)
+    # ---------- 8. 检索（BM25 倒排；embedding 启用时为混合检索） ----------
+    print("\n=== 8. 检索 ===")
+    hits = search("self attention mechanism", top_k=3)
     ok = bool(hits) and hits[0].paper_id == results["paper1"]
-    failed += not check("语义检索命中", ok, f"top1={hits[0].title if hits else None}, score={hits[0].score if hits else None}")
-    hits2 = search("注意力 高效 计算", top_k=3)
+    failed += not check("检索命中 Attention Is All You Need", ok, f"top1={hits[0].title if hits else None}")
+    hits2 = search("efficient attention computation", top_k=3)
     ok = bool(hits2) and results["paper2"] in [h.paper_id for h in hits2]
-    failed += not check("跨论文检索命中 FlashAttention", ok, f"papers={[h.paper_id for h in hits2]}")
+    failed += not check("检索命中 FlashAttention", ok, f"papers={[h.paper_id for h in hits2]}")
 
     # ---------- 9. 检索问答 ----------
     print("\n=== 9. 检索问答 ===")
@@ -191,26 +189,21 @@ def run(skip_llm: bool) -> int:
     citations = qa.get("citations", [])
     failed += not check("回答带引用来源", bool(citations), f"citations={len(citations)} 条")
 
-    # ---------- 10. embedding / Milvus 降级 ----------
-    print("\n=== 10. Milvus 降级（纯 BM25）===")
+    # ---------- 10. Milvus 不可用 ----------
+    print("\n=== 10. Milvus 不可用时不崩溃 ===")
     from paper_agent.rag import pipeline as _rag_pipeline
-    from paper_agent.rag import retriever as _rag_retriever
 
     old_store = _rag_pipeline._store
-    old_retriever = _rag_retriever._retriever
 
     class _NoMilvus:  # 模拟 Milvus 不可用
         available = False
 
     _rag_pipeline._store = _NoMilvus()
-    _rag_retriever._retriever = None
     try:
         hits3 = search("transformer", top_k=3)
-        ok = bool(hits3)
-        failed += not check("降级后检索正常（纯 BM25）", ok, f"hits={len(hits3)}")
+        failed += not check("检索返回空（不崩溃）", hits3 == [], f"hits={len(hits3)}")
     finally:
         _rag_pipeline._store = old_store
-        _rag_retriever._retriever = old_retriever
 
     # ---------- 11. MCP 工具冒烟 + 增量/更新/删除 ----------
     print("\n=== 11. MCP 工具 + 增量更新 + 删除 ===")
@@ -234,11 +227,11 @@ def run(skip_llm: bool) -> int:
 
     r = rag_index_missing()
     ok = '"ok": true' in r and '"total_indexed": 0' in r
-    failed += not check("rag_index_missing 增量幂等（已全索引，无需新增）", ok, r[:120])
+    failed += not check("rag_index_missing 增量幂等（已全索引或未启用向量）", ok, r[:120])
 
     r = rag_update_paper(results["paper1"])
     ok = '"ok": true' in r and '"indexed"' in r
-    failed += not check("rag_update_paper 重建索引", ok, r[:120])
+    failed += not check("rag_update_paper 重建 BM25 索引", ok, r[:120])
 
     r = rag_list_papers()
     ok = '"indexed": true' in r

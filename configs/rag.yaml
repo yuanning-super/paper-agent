@@ -10,6 +10,7 @@ milvus:
   dim: 512                        # 向量维度（与 embedding 模型输出一致）
 
 embedding:
+  enabled: false                  # 是否启用本地向量（启用需先下载约 100MB 模型；关闭时检索为纯 BM25）
   model: BAAI/bge-small-zh-v1.5   # 本地中文 embedding 模型
   batch_size: 32                  # 批量嵌入大小
 
@@ -20,9 +21,8 @@ chunking:
 
 retrieval:
   top_k: 5                        # 默认返回条数
-  bm25_weight: 0.5                # 混合检索 BM25 权重（向量权重 1-w）
   max_per_paper: 2                # 多样性：每篇论文最多占用的结果名额
-  candidate_scale: 5              # 向量候选 = top_k * candidate_scale（用于融合）
+  candidate_scale: 5              # 各路候选 = top_k * candidate_scale（RRF 融合用）
 
 mcp:
   name: paper-rag                 # MCP 服务器名

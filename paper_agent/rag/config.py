@@ -32,6 +32,7 @@ class MilvusConfig:
 
 @dataclass
 class EmbeddingConfig:
+    enabled: bool = False  # 默认不启用：关闭时检索为纯 BM25，无需下载模型
     model: str = "BAAI/bge-small-zh-v1.5"
     batch_size: int = 32
 
@@ -46,7 +47,6 @@ class ChunkingConfig:
 @dataclass
 class RetrievalConfig:
     top_k: int = 5
-    bm25_weight: float = 0.5
     max_per_paper: int = 2
     candidate_scale: int = 5
 

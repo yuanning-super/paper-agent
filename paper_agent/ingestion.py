@@ -9,12 +9,12 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+from shutil import copy2
 
 import requests
 
 from .config import load_settings
 from .db import (
-    Chunk,
     get_meta_int,
     get_paper,
     insert_paper,
@@ -22,8 +22,10 @@ from .db import (
     set_meta,
     update_paper,
 )
-from .embed import get_embedder
-from .utils import detect_heading, split_sentences_zh
+from .rag.chunking import (
+    chunk_text,  # 分块逻辑归属 rag 模块，此处 re-export 保持入口兼容
+)
+from .rag.embedding import get_embedder
 
 logger = logging.getLogger("paper_agent")
 
@@ -153,23 +155,38 @@ def extract_text(pdf_path: Path) -> tuple[str, bool]:
     return text, len(text.strip()) < 200
 
 
-def chunk_text(text: str, size: int | None = None, overlap: int | None = None) -> list[Chunk]:
-    """按字符窗口分块，并带章节标题启发式标注。分块参数来自 configs/rag.yaml。"""
-    from .rag.config import load_rag_config
+def extract_figures(pdf_path: Path, paper_id: int) -> list[dict]:
+    """从 PDF 提取内嵌图片（论文图表），保存为 PNG，返回 [{name, page, width, height}]。
 
-    chunking = load_rag_config().chunking
-    size = size or chunking.size
-    overlap = overlap or chunking.overlap
-    pieces = split_sentences_zh(text, size, overlap)
-    chunks: list[Chunk] = []
-    current_heading: str | None = None
-    for i, piece in enumerate(pieces):
-        first_line = piece.splitlines()[0].strip() if piece else ""
-        heading = detect_heading(first_line)
-        if heading:
-            current_heading = heading
-        chunks.append(Chunk(paper_id=0, seq=i, content=piece, heading=current_heading))
-    return chunks
+    过滤小图标（logo/公式符号），按 xref 去重（同一图片跨页重复只留首次）。
+    """
+    import fitz  # PyMuPDF
+
+    settings = load_settings()
+    out_dir = settings.figures_dir / str(paper_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    figures: list[dict] = []
+    seen_xref: set[int] = set()
+
+    doc = fitz.open(pdf_path)
+    try:
+        for page_no, page in enumerate(doc, start=1):
+            for img in page.get_images(full=True):
+                xref = img[0]
+                if xref in seen_xref or len(figures) >= 40:
+                    continue
+                pix = fitz.Pixmap(doc, xref)
+                if pix.width < 150 or pix.height < 100:  # 过滤小图标
+                    continue
+                if pix.n - pix.alpha > 3:  # CMYK 等少见色彩空间，转 RGB
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                name = f"fig_{len(figures):02d}_p{page_no}.png"
+                pix.save(out_dir / name)
+                seen_xref.add(xref)
+                figures.append({"name": name, "page": page_no, "width": pix.width, "height": pix.height})
+    finally:
+        doc.close()
+    return figures
 
 
 # ---------- LLM 元数据增强 ----------
@@ -267,8 +284,6 @@ def ingest_pdf_file(path: str | Path) -> IngestResult:
     result.title = title
     result.events.append(f"论文已登记（#{paper_id}）：{title}")
 
-    from shutil import copy2
-
     settings = load_settings()
     dest = settings.pdfs_dir / f"upload_{paper_id}.pdf"
     copy2(path, dest)
@@ -280,23 +295,19 @@ def ingest_pdf_file(path: str | Path) -> IngestResult:
     update_paper(paper_id, status="chunked")
     result.events.append(f"分块完成：{len(chunks)} 块")
 
+    # 写入 Milvus（BM25 倒排；embedding 启用时附带稠密向量）
+    from .rag.pipeline import index_embedded_chunks
+
+    vecs = None
     embedder = get_embedder()
     if embedder.available:
         vecs = embedder.embed_many([c.content for c in chunks])
-        if vecs is not None:
-            for c, v in zip(chunks, vecs):
-                c.embedding = v.tobytes()
-            replace_chunks(paper_id, chunks)
-            update_paper(paper_id, status="embedded")
-            result.events.append("向量嵌入完成")
-            # 写入 Milvus 向量索引
-            from .rag.pipeline import index_embedded_chunks
-
-            r = index_embedded_chunks(paper_id, chunks, vecs)
-            if r.get("ok"):
-                result.events.append(f"已写入 Milvus 索引（{r['indexed']} 块）")
-            else:
-                result.events.append(f"Milvus 索引失败（{r.get('error')}），检索降级纯 BM25")
+    update_paper(paper_id, status="embedded")
+    r = index_embedded_chunks(paper_id, chunks, vecs)
+    if r.get("ok"):
+        result.events.append(f"已写入 Milvus 索引（{r['indexed']} 块）")
+    else:
+        result.events.append(f"Milvus 索引失败（{r.get('error')}），检索暂不可用")
 
     # 用提取文本生成摘要用于增强
     update_paper(paper_id, abstract=text[:2000])

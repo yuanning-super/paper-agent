@@ -1,4 +1,11 @@
-"""Milvus 存储封装：连接（Lite 本地 / 服务器）、集合管理、分块增删查、向量检索。"""
+"""Milvus 存储封装：BM25 倒排索引（原生稀疏向量）+ 可选向量索引。
+
+- 本地 Lite 模式：uri 为文件路径（如 data/milvus.db），零依赖服务；
+- 服务器模式：uri 为 http://host:19530。
+- 分块入库时由 Milvus BM25 Function 自动分词生成稀疏向量；
+  embedding.enabled=true 时额外写入稠密向量并建索引。
+所有配置来自 configs/rag.yaml。
+"""
 
 from __future__ import annotations
 
@@ -10,13 +17,6 @@ logger = logging.getLogger("paper_agent")
 
 
 class MilvusStore:
-    """Milvus 客户端封装。
-
-    - 本地 Lite 模式：uri 为文件路径（如 data/milvus.db），零依赖服务；
-    - 服务器模式：uri 为 http://host:19530。
-    所有配置来自 configs/rag.yaml。
-    """
-
     def __init__(self, config: MilvusConfig | None = None):
         self.config = config or load_rag_config().milvus
         self._max_content = load_rag_config().chunking.content_max_length
@@ -38,11 +38,10 @@ class MilvusStore:
         if self._available is not None:
             return self._available
         try:
-            client = self.connect()
-            client.list_collections()  # 触发真实连接
+            self.connect().list_collections()  # 触发真实连接
             self._available = True
         except Exception as e:  # noqa: BLE001
-            logger.warning("Milvus 不可用（%s），检索将降级为纯 BM25", e)
+            logger.warning("Milvus 不可用：%s", e)
             self._available = False
         return self._available
 
@@ -55,36 +54,68 @@ class MilvusStore:
     # ---------- 集合管理 ----------
 
     def ensure_collection(self) -> None:
-        """创建集合（不存在时）并建向量索引。"""
-        from pymilvus import DataType, MilvusClient
-        from pymilvus.milvus_client import IndexParams
-
+        """创建集合（不存在时）。schema 与 embedding 配置不一致时重建（丢弃旧索引，重跑入库即可）。"""
         client = self.connect()
         if self.collection_exists():
-            return
+            if self._schema_matches():
+                return
+            logger.info("集合 schema 与配置不一致（embedding 开关变化），重建集合")
+            client.drop_collection(self.config.collection)
+        self._create_collection()
+        self._create_indexes()
+
+    def _schema_matches(self) -> bool:
+        want_dense = load_rag_config().embedding.enabled
+        info = self.connect().describe_collection(self.config.collection)
+        names = {f["name"] for f in info["fields"]}
+        return ("embedding" in names) == want_dense and "sparse" in names
+
+    def _create_collection(self) -> None:
+        from pymilvus import DataType, Function, FunctionType, MilvusClient
+
+        cfg = load_rag_config()
+        client = self.connect()
         schema = MilvusClient.create_schema(auto_id=True, enable_dynamic_field=False)
         schema.add_field("id", DataType.INT64, is_primary=True, auto_id=True)
         schema.add_field("paper_id", DataType.INT64)
         schema.add_field("seq", DataType.INT64)
         schema.add_field("heading", DataType.VARCHAR, max_length=256)
-        schema.add_field(
-            "content", DataType.VARCHAR, max_length=self._max_content
+        schema.add_field("content", DataType.VARCHAR, max_length=self._max_content, enable_analyzer=True)
+        schema.add_field("sparse", DataType.SPARSE_FLOAT_VECTOR)
+        # BM25：入库时自动对 content 分词生成稀疏向量
+        schema.add_function(
+            Function(
+                name="bm25",
+                function_type=FunctionType.BM25,
+                input_field_names=["content"],
+                output_field_names="sparse",
+            )
         )
-        schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=self.config.dim)
+        if cfg.embedding.enabled:
+            schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=self.config.dim)
         client.create_collection(self.config.collection, schema=schema)
-        logger.info("Milvus 集合 %s 已创建", self.config.collection)
+        logger.info("Milvus 集合 %s 已创建（BM25 倒排%s）", self.config.collection, "+稠密向量" if cfg.embedding.enabled else "")
 
-        # 向量索引：优先 AUTOINDEX，个别 Lite 版本不支持时退回 FLAT
-        # （pymilvus 3.x 要求 IndexParams 对象而非 dict）
-        try:
-            params = IndexParams()
-            params.add_index(field_name="embedding", index_type="AUTOINDEX", metric_type="COSINE")
-            client.create_index(self.config.collection, index_params=params)
-        except Exception:  # noqa: BLE001
-            params = IndexParams()
-            params.add_index(field_name="embedding", index_type="FLAT", metric_type="COSINE")
-            client.create_index(self.config.collection, index_params=params)
-        # 标量索引（加速按 paper_id 过滤；Lite 可能不支持，失败仅告警）
+    def _create_indexes(self) -> None:
+        from pymilvus.milvus_client import IndexParams
+
+        client = self.connect()
+        cfg = load_rag_config()
+        # BM25 稀疏倒排索引
+        params = IndexParams()
+        params.add_index(field_name="sparse", index_type="SPARSE_INVERTED_INDEX", metric_type="BM25")
+        client.create_index(self.config.collection, index_params=params)
+        # 稠密向量索引（仅启用 embedding 时）
+        if cfg.embedding.enabled:
+            try:
+                params = IndexParams()
+                params.add_index(field_name="embedding", index_type="AUTOINDEX", metric_type="COSINE")
+                client.create_index(self.config.collection, index_params=params)
+            except Exception:  # noqa: BLE001 —— 个别 Lite 版本不支持 AUTOINDEX
+                params = IndexParams()
+                params.add_index(field_name="embedding", index_type="FLAT", metric_type="COSINE")
+                client.create_index(self.config.collection, index_params=params)
+        # 标量索引（Lite 可能不支持，失败仅告警）
         try:
             params = IndexParams()
             params.add_index(field_name="paper_id", index_type="INVERTED")
@@ -95,7 +126,8 @@ class MilvusStore:
     # ---------- 写入 ----------
 
     def insert_chunks(self, rows: list[dict]) -> int:
-        """批量插入分块。rows: [{paper_id, seq, heading, content, embedding(ndarray/list)}]"""
+        """批量插入分块。rows: [{paper_id, seq, heading, content, embedding?}]
+        sparse 由 BM25 Function 自动生成；embedding 仅在启用向量时提供。"""
         if not rows:
             return 0
         self.ensure_collection()
@@ -105,7 +137,7 @@ class MilvusStore:
                 "seq": int(r["seq"]),
                 "heading": (r.get("heading") or "")[:256],
                 "content": (r["content"] or "")[: self._max_content],
-                "embedding": r["embedding"],
+                **({"embedding": r["embedding"]} if "embedding" in r else {}),
             }
             for r in rows
         ]
@@ -140,62 +172,48 @@ class MilvusStore:
             )
         )
 
-    def get_chunks(self, paper_id: int) -> list[dict]:
-        """某论文的全部分块（按 seq 排序，不含向量）。"""
-        if not self.collection_exists():
-            return []
-        rows = self.connect().query(
-            self.config.collection,
-            filter=f"paper_id == {int(paper_id)}",
-            output_fields=["id", "paper_id", "seq", "heading", "content"],
-            limit=16384,
-        )
-        rows.sort(key=lambda r: r["seq"])
-        return rows
-
-    def fetch_all(self) -> list[dict]:
-        """分页取出全库分块（用于构建 BM25 索引），按 (paper_id, seq) 排序。"""
-        if not self.collection_exists():
-            return []
-        client = self.connect()
-        page = 4096
-        out: list[dict] = []
-        offset = 0
-        while True:
-            rows = client.query(
-                self.config.collection,
-                filter="",
-                output_fields=["id", "paper_id", "seq", "heading", "content"],
-                limit=page,
-                offset=offset,
-            )
-            out.extend(rows)
-            if len(rows) < page:
-                break
-            offset += page
-        out.sort(key=lambda r: (r["paper_id"], r["seq"]))
-        return out
-
     def paper_ids(self) -> list[int]:
         if not self.collection_exists():
             return []
         rows = self.connect().query(
-            self.config.collection,
-            filter="",
-            output_fields=["paper_id"],
-            limit=16384,
+            self.config.collection, filter="", output_fields=["paper_id"], limit=16384
         )
         return sorted({int(r["paper_id"]) for r in rows})
 
     # ---------- 检索 ----------
 
-    def search(self, query_vec, top_k: int, paper_id: int | None = None) -> list[dict]:
-        """向量检索（COSINE），返回 [{id, paper_id, seq, heading, content, score}]。"""
+    def search_bm25(self, query: str, top_k: int, paper_id: int | None = None) -> list[dict]:
+        """BM25 倒排检索（Milvus 原生稀疏向量），返回 [{paper_id, seq, heading, content, score}]。"""
+        self.ensure_collection()
+        filter_expr = f"paper_id == {int(paper_id)}" if paper_id is not None else ""
+        hits = self.connect().search(
+            self.config.collection,
+            data=[query],
+            anns_field="sparse",
+            limit=top_k,
+            filter=filter_expr,
+            output_fields=["paper_id", "seq", "heading", "content"],
+            search_params={"metric_type": "BM25", "params": {}},
+        )[0]
+        return [
+            {
+                "paper_id": h["entity"]["paper_id"],
+                "seq": h["entity"]["seq"],
+                "heading": h["entity"].get("heading"),
+                "content": h["entity"]["content"],
+                "score": float(h["distance"]),
+            }
+            for h in hits
+        ]
+
+    def search_dense(self, query_vec, top_k: int, paper_id: int | None = None) -> list[dict]:
+        """稠密向量检索（COSINE，仅 embedding 启用时可用）。"""
         self.ensure_collection()
         filter_expr = f"paper_id == {int(paper_id)}" if paper_id is not None else ""
         hits = self.connect().search(
             self.config.collection,
             data=[list(query_vec)],
+            anns_field="embedding",
             limit=top_k,
             filter=filter_expr,
             output_fields=["paper_id", "seq", "heading", "content"],
@@ -203,7 +221,6 @@ class MilvusStore:
         )[0]
         return [
             {
-                "id": h["id"],
                 "paper_id": h["entity"]["paper_id"],
                 "seq": h["entity"]["seq"],
                 "heading": h["entity"].get("heading"),

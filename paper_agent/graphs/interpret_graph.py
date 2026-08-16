@@ -1,30 +1,48 @@
-"""解读报告（agent loop 探索 + 工作流收尾）：
+"""解读流水线：load（定位论文 + 章节拆分 + 仓库素材）→ 强制委派四个子 agent。
 
-阶段一 prebuilt agent loop：理解用户请求 → 入库 / 找 GitHub / 分析仓库，产出 paper_id；
-阶段二 工作流节点：确定论文 → 组装全文与仓库素材 → 按 8 章节模板生成报告 → 落盘。
+- background：实验背景调研（数据集与 baseline）
+- method：方法创新性与实现分析（代码辅助）
+- experiment：实验结果与分析（结合背景调研）
+- report：综合三份子报告与原文，输出最终解读报告
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import operator
 import re
-from typing import TypedDict
+from pathlib import Path
+from typing import Annotated, TypedDict
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.config import get_config
 from langgraph.graph import END, START, StateGraph
 
 from ..config import load_settings
-from ..db import get_chunks, get_paper, update_paper
+from ..db import find_paper_by_arxiv_id, get_paper, update_paper
+from ..ingestion import extract_figures, extract_text
 from ..llm import get_llm
-from ..prompts import INTERPRET_AGENT_SYSTEM, REPORT_SYSTEM, REPORT_USER_TEMPLATE
+from ..prompts import (
+    BACKGROUND_AGENT_SYSTEM,
+    BACKGROUND_USER_TEMPLATE,
+    EXPERIMENT_AGENT_SYSTEM,
+    EXPERIMENT_USER_TEMPLATE,
+    METHOD_AGENT_SYSTEM,
+    METHOD_USER_TEMPLATE,
+    REPORT_AGENT_SYSTEM,
+    REPORT_USER_TEMPLATE,
+)
+from ..rag.chunking import split_sections
 from ..tools import (
     analyze_github_repo,
     arxiv_fetch_metadata,
     find_github_url,
     get_paper_summary,
     ingest_arxiv_paper,
+    read_repo_file,
+    read_section,
     search_library,
+    set_section_cache,
 )
 from ..utils import truncate
 from ._compat import get_create_agent
@@ -34,195 +52,269 @@ logger = logging.getLogger("paper_agent")
 PAPER_ID_RE = re.compile(r"#\s*(\d+)|论文\s*ID[：:\s]*(\d+)|paper_id[：:\s]*(\d+)")
 ARXIV_ID_RE = re.compile(r"(?:arxiv:)?(\d{4}\.\d{4,5})", re.IGNORECASE)
 
-REPORT_SECTIONS = [
-    "## 1. 背景与动机",
-    "## 2. 核心贡献",
-    "## 3. 方法与技术细节",
-    "## 4. 实验结果",
-    "## 5. 局限与不足",
-    "## 6. 相关工作对比",
-    "## 7. 代码仓库分析",
-    "## 8. 一句话总结",
-]
+# 论文定位 agent（自然语言查询时用）
+RESOLVE_SYSTEM = (
+    "你在一个论文库中。根据用户描述定位要解读的论文：可用 search_library 检索、"
+    "get_paper_summary 确认、arxiv_fetch_metadata 查元数据；论文未入库时先 ingest_arxiv_paper 入库。"
+    "最后只回复一行：论文 ID #N（N 为数字）。"
+)
 
 
 class InterpretState(TypedDict, total=False):
     query: str
     paper_id: int
     error: str
-    agent_output: str
-    github_material: str
+    events: Annotated[list[str], operator.add]
+    paper_map: str
+    repo_material: str
+    background: str
+    method_analysis: str
+    experiment_analysis: str
     report_text: str
     report_path: str
 
 
-# ---------- 阶段一：探索 agent ----------
+# ---------- 工具函数 ----------
 
-def _build_explorer():
+def _run_subagent(system: str, user: str, tools: list) -> str:
+    """运行一个 prebuilt 子 agent，返回其最终文本。
+
+    config 继承父级（含回调管理器），否则外层 stream_mode="messages" 拿不到子 agent 的 token 流。
+    """
     create_agent = get_create_agent()
-    return create_agent(
-        model=get_llm(),
-        tools=[
-            search_library,
-            arxiv_fetch_metadata,
-            ingest_arxiv_paper,
-            find_github_url,
-            analyze_github_repo,
-            get_paper_summary,
-        ],
-        system_prompt=INTERPRET_AGENT_SYSTEM,
+    agent = create_agent(
+        model=get_llm(max_tokens=6000),
+        tools=tools,
+        system_prompt=system,
     )
+    result = agent.invoke(
+        {"messages": [("user", user)]},
+        config={**get_config(), "recursion_limit": 30},
+    )
+    for msg in reversed(result["messages"]):
+        if msg.type == "ai" and msg.content:
+            return msg.content if isinstance(msg.content, str) else str(msg.content)
+    return ""
 
 
-def _extract_paper_id(text: str) -> int | None:
-    m = PAPER_ID_RE.search(text)
+def _join_role(sections: list[dict], role: str, limit: int) -> str:
+    """把指定角色的章节内容拼接并截断（角色由 split_sections 计算，含父级继承）。"""
+    parts = [f"### {s['title']}\n{s['content']}" for s in sections if s.get("role") == role]
+    return truncate("\n\n".join(parts), limit, mode="head") if parts else "（无）"
+
+
+def _resolve_paper_id(query: str) -> tuple[int | None, str]:
+    """定位论文：短路匹配 → 定位 agent → arXiv 兜底。"""
+    m = re.search(r"paper[:#\s]*(\d+)", query)
+    if m and get_paper(int(m.group(1))):
+        return int(m.group(1)), f"已定位库内论文 #{m.group(1)}"
+    m = ARXIV_ID_RE.search(query)
     if m:
-        return int(next(g for g in m.groups() if g))
-    return None
+        paper = find_paper_by_arxiv_id(m.group(1))
+        if paper:
+            return paper["id"], f"已定位库内论文 #{paper['id']}"
+
+    agent = get_create_agent()(
+        model=get_llm(),
+        tools=[search_library, get_paper_summary, arxiv_fetch_metadata, ingest_arxiv_paper],
+        system_prompt=RESOLVE_SYSTEM,
+    )
+    result = agent.invoke(
+        {"messages": [("user", query)]},
+        config={**get_config(), "recursion_limit": 30},
+    )
+    final_text = ""
+    for msg in reversed(result["messages"]):
+        if msg.type == "ai" and msg.content:
+            final_text = msg.content if isinstance(msg.content, str) else str(msg.content)
+            break
+    mm = PAPER_ID_RE.search(final_text)
+    if mm:
+        return int(next(g for g in mm.groups() if g)), final_text
+    return None, final_text
 
 
-def _scan_tool_messages(state: dict) -> int | None:
-    """从 agent 的工具消息 JSON 中挖掘 paper_id（模型可能未在最终文本中复述）。"""
-    for msg in reversed(state.get("messages", [])):
-        if msg.type == "tool":
-            content = msg.content
-            if isinstance(content, str):
-                try:
-                    data = json.loads(content)
-                    if isinstance(data, dict) and data.get("paper_id"):
-                        return int(data["paper_id"])
-                except (json.JSONDecodeError, ValueError):
-                    pass
-    return None
+# ---------- 节点 ----------
 
-
-def prepare_node(state: InterpretState) -> dict:
+def load_node(state: InterpretState) -> dict:
     try:
-        query = state["query"]
-        # 确定性短路：查询已指明库内论文 ID 或 arXiv ID（已在库中）时，跳过探索 agent
-        m_paper = re.search(r"paper[:#\s]*(\d+)", query)
-        if m_paper:
-            paper_id = int(m_paper.group(1))
-            if get_paper(paper_id):
-                return {"paper_id": paper_id, "agent_output": f"已定位库内论文 #{paper_id}"}
-        m_arxiv = ARXIV_ID_RE.search(query)
-        if m_arxiv:
-            from ..db import find_paper_by_arxiv_id
+        paper_id, note = _resolve_paper_id(state["query"])
+        if paper_id is None:
+            return {"error": "无法确定要解读的论文。请提供 arXiv ID 或论文库中的论文 ID。"}
+        paper = get_paper(paper_id)
+        events = [note]
 
-            paper = find_paper_by_arxiv_id(m_arxiv.group(1))
-            if paper:
-                return {"paper_id": paper["id"], "agent_output": f"已定位库内论文 #{paper['id']}"}
+        # 章节拆分：从 PDF 提取并切分，写入缓存供 read_section 按需读取
+        sections = []
+        fig_count = 0
+        if paper.get("pdf_path") and Path(paper["pdf_path"]).exists():
+            text, _ = extract_text(Path(paper["pdf_path"]))
+            sections = split_sections(text)
+            figures = extract_figures(Path(paper["pdf_path"]), paper_id)
+            fig_count = len(figures)
+        if not sections:
+            sections = [{"title": "全文", "content": (paper.get("abstract") or ""), "role": "other"}]
+        set_section_cache(paper_id, sections)
+        events.append(f"章节拆分完成：{len(sections)} 节")
+        if fig_count:
+            events.append(f"原文图表已提取：{fig_count} 张")
 
-        explorer = _build_explorer()
-        result = explorer.invoke(
-            {"messages": [("user", state["query"])]},
-            config={"recursion_limit": 30},
+        # 论文地图：摘要 + 章节目录（编号与 read_section 一致）
+        paper_map = "\n".join(
+            f"{i}. {s['title']}（{s.get('role', 'other')}，{len(s['content'])} 字）"
+            for i, s in enumerate(sections)
         )
-        messages = result.get("messages", [])
-        final_text = ""
-        for msg in reversed(messages):
-            if msg.type == "ai" and msg.content:
-                final_text = msg.content if isinstance(msg.content, str) else str(msg.content)
-                break
 
-        paper_id = _extract_paper_id(final_text)
-        if paper_id is None:
-            paper_id = _scan_tool_messages(result)
+        # GitHub 仓库：查找链接并分析
+        repo_material = ""
+        if not paper.get("github_url"):
+            try:
+                found = json.loads(str(find_github_url.invoke({"paper_id": paper_id})))
+                if found.get("url"):
+                    paper = get_paper(paper_id)  # 重新读取回填后的记录
+            except (json.JSONDecodeError, ValueError):
+                pass
+        if paper.get("github_url"):
+            try:
+                repo_material = str(analyze_github_repo.invoke({"url": paper["github_url"]}))
+                events.append(f"代码仓库已分析：{paper['github_url']}")
+            except Exception as e:  # noqa: BLE001
+                logger.warning("仓库分析失败：%s", e)
 
-        if paper_id is None:
-            # 兜底：查询本身含 arXiv ID
-            m = ARXIV_ID_RE.search(state["query"])
-            if m:
-                from ..db import find_paper_by_arxiv_id
-
-                paper = find_paper_by_arxiv_id(m.group(1))
-                if paper:
-                    paper_id = paper["id"]
-        if paper_id is None:
-            return {"error": "无法确定要解读的论文。请提供 arXiv ID 或论文库中的论文 ID。", "agent_output": final_text}
-        return {"paper_id": paper_id, "agent_output": final_text}
+        return {
+            "paper_id": paper_id,
+            "paper_map": paper_map,
+            "repo_material": repo_material,
+            "events": events,
+        }
     except Exception as e:  # noqa: BLE001
         return {"error": f"论文资料准备失败：{e}"}
 
 
-# ---------- 阶段二：报告生成 ----------
+def background_node(state: InterpretState) -> dict:
+    if state.get("error"):
+        return {}
+    try:
+        paper = get_paper(state["paper_id"])
+        sections = _sections(state["paper_id"])
+        user = BACKGROUND_USER_TEMPLATE.format(
+            title=paper["title"],
+            abstract=truncate(paper.get("abstract") or "", 2000, mode="head"),
+            experiment=_join_role(sections, "experiment", 8000),
+            related=_join_role(sections, "related", 4000),
+            references=_join_role(sections, "references", 6000),
+        )
+        out = _run_subagent(
+            BACKGROUND_AGENT_SYSTEM, user, [read_section, search_library, get_paper_summary]
+        )
+        return {"background": out, "events": ["✅ 背景调研完成（数据集与 baseline）"]}
+    except Exception as e:  # noqa: BLE001 —— 并行节点失败不中断整体，写入输出字段由报告 agent 如实说明
+        return {"background": f"（背景调研失败：{e}）", "events": [f"背景调研失败：{e}"]}
+
+
+def method_node(state: InterpretState) -> dict:
+    if state.get("error"):
+        return {}
+    try:
+        paper = get_paper(state["paper_id"])
+        sections = _sections(state["paper_id"])
+        user = METHOD_USER_TEMPLATE.format(
+            title=paper["title"],
+            intro=_join_role(sections, "intro", 3000),
+            method=_join_role(sections, "method", 10_000),
+            repo_material=truncate(state.get("repo_material", ""), 8000, mode="head") or "（无）",
+        )
+        out = _run_subagent(
+            METHOD_AGENT_SYSTEM, user, [read_section, read_repo_file, search_library]
+        )
+        return {"method_analysis": out, "events": ["✅ 方法分析完成（创新性与实现）"]}
+    except Exception as e:  # noqa: BLE001
+        return {"method_analysis": f"（方法分析失败：{e}）", "events": [f"方法分析失败：{e}"]}
+
+
+def experiment_node(state: InterpretState) -> dict:
+    if state.get("error"):
+        return {}
+    try:
+        paper = get_paper(state["paper_id"])
+        sections = _sections(state["paper_id"])
+        user = EXPERIMENT_USER_TEMPLATE.format(
+            title=paper["title"],
+            experiment=_join_role(sections, "experiment", 8000),
+        )
+        out = _run_subagent(EXPERIMENT_AGENT_SYSTEM, user, [read_section])
+        return {"experiment_analysis": out, "events": ["✅ 实验分析完成"]}
+    except Exception as e:  # noqa: BLE001
+        return {"experiment_analysis": f"（实验分析失败：{e}）", "events": [f"实验分析失败：{e}"]}
+
 
 def report_node(state: InterpretState) -> dict:
+    if state.get("error"):
+        return {"error": state["error"]}
     try:
         settings = load_settings()
         paper = get_paper(state["paper_id"])
-        if not paper:
-            return {"error": f"论文 #{state['paper_id']} 不存在"}
-
-        # 全文组装（60k 字符预算，头尾保留）
-        chunks = get_chunks(state["paper_id"])
-        full_text = "\n\n".join(c["content"] for c in chunks)
-        full_text = truncate(full_text, settings.full_text_budget, mode="head_tail")
-
-        # GitHub 素材：未记录链接时先查找，找到后分析仓库
-        github_material = ""
-        try:
-            if not paper.get("github_url"):
-                found = find_github_url.invoke({"paper_id": state["paper_id"]})
-                data = json.loads(str(found))
-                if data.get("url"):
-                    paper = get_paper(state["paper_id"])  # 重新读取回填后的记录
-            if paper.get("github_url"):
-                analyzed = analyze_github_repo.invoke({"url": paper["github_url"]})
-                github_material = str(analyzed)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("GitHub 查找/分析失败：%s", e)
-            github_material = f"GitHub 查找/分析失败：{e}"
-
-        prompt = REPORT_USER_TEMPLATE.format(
-            title=paper.get("title", ""),
+        user = REPORT_USER_TEMPLATE.format(
+            title=paper["title"],
             authors=", ".join(paper.get("authors", [])[:10]),
             arxiv_id=paper.get("arxiv_id") or "—",
             published=paper.get("published") or "—",
-            categories=", ".join(paper.get("categories", [])),
             abstract=(paper.get("abstract") or "")[:1500],
-            full_text=full_text,
-            github_material=github_material or "（未找到官方代码仓库）",
+            sections_map=state.get("paper_map", ""),
+            background=truncate(state.get("background", ""), 10_000, mode="head"),
+            method_analysis=truncate(state.get("method_analysis", ""), 10_000, mode="head"),
+            experiment_analysis=truncate(state.get("experiment_analysis", ""), 10_000, mode="head"),
+            repo_material=truncate(state.get("repo_material", ""), 8000, mode="head") or "（未找到官方代码仓库）",
         )
+        out = _run_subagent(REPORT_AGENT_SYSTEM, user, [read_section])
 
-        # 用 invoke（而非手动 stream）：LangGraph 的 stream_mode="messages" 才能拿到 token 流
-        resp = get_llm(
-            max_tokens=settings.report_max_tokens,
-            temperature=settings.report_temperature,
-        ).invoke([SystemMessage(content=REPORT_SYSTEM), HumanMessage(content=prompt)])
-        report_text = resp.content if isinstance(resp.content, str) else str(resp.content)
-
-        # 章节完整性兜底：缺哪节补哪节标题（模型偶发省略标题时不丢结构）
-        for section in REPORT_SECTIONS:
-            alt = section.replace("## 1. ", "## ").split(". ", 1)[-1]
-            if section not in report_text and alt not in report_text:
-                report_text += f"\n\n{section}\n（本节内容缺失）\n"
+        # 保存各阶段结果（与最终报告一并落盘，供回溯查阅）
+        step_names = {
+            "background": ("背景调研", state.get("background", "")),
+            "method": ("方法分析", state.get("method_analysis", "")),
+            "experiment": ("实验分析", state.get("experiment_analysis", "")),
+        }
+        for key, (label, content) in step_names.items():
+            (settings.reports_dir / f"{state['paper_id']}.{key}.md").write_text(
+                f"# {label}\n\n{content}\n", encoding="utf-8"
+            )
 
         report_path = settings.reports_dir / f"{state['paper_id']}.md"
         report_path.write_text(
-            f"# 论文解读：{paper.get('title', '')}\n\n{report_text}\n", encoding="utf-8"
+            f"# 论文解读：{paper.get('title', '')}\n\n{out}\n", encoding="utf-8"
         )
-        update_paper(
-            state["paper_id"],
-            report_path=str(report_path),
-            status="interpreted",
-        )
-        return {"report_text": report_text, "report_path": str(report_path)}
+        update_paper(state["paper_id"], report_path=str(report_path), status="interpreted")
+        return {
+            "report_text": out,
+            "report_path": str(report_path),
+            "events": ["✅ 解读报告已生成（含各阶段结果）"],
+        }
     except Exception as e:  # noqa: BLE001
         return {"error": f"报告生成失败：{e}"}
 
 
-def _router(state: InterpretState) -> str:
-    return END if state.get("error") else "report"
+def _sections(paper_id: int) -> list[dict]:
+    from ..tools import get_section_cache
+
+    return get_section_cache(paper_id)
 
 
 # ---------- 图组装 ----------
 
 def build_interpret_graph(checkpointer=None):
     g = StateGraph(InterpretState)
-    g.add_node("prepare", prepare_node)
+    g.add_node("load", load_node)
+    g.add_node("background", background_node)
+    g.add_node("method", method_node)
+    g.add_node("experiment", experiment_node)
     g.add_node("report", report_node)
-    g.add_edge(START, "prepare")
-    g.add_conditional_edges("prepare", _router, {"report": "report", END: END})
+    g.add_edge(START, "load")
+    # 三个分析子 agent 互不依赖 → 并行执行（fan-out）；report 等待三路完成（fan-in）
+    g.add_edge("load", "background")
+    g.add_edge("load", "method")
+    g.add_edge("load", "experiment")
+    g.add_edge("background", "report")
+    g.add_edge("method", "report")
+    g.add_edge("experiment", "report")
     g.add_edge("report", END)
     return g.compile(checkpointer=checkpointer)

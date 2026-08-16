@@ -94,10 +94,10 @@ def extract_node(state: InnovateState) -> dict:
     paper_ids = state["paper_ids"]
     if not paper_ids:
         return {"error": "未指定论文"}
-    events: list[str] = []
-    all_innovations: list[dict] = []
-    for paper_id in paper_ids:
-        try:
+    try:
+        events: list[str] = []
+        all_innovations: list[dict] = []
+        for paper_id in paper_ids:
             paper = get_paper(paper_id)
             if not paper:
                 events.append(f"论文 #{paper_id} 不存在，已跳过")
@@ -124,11 +124,11 @@ def extract_node(state: InnovateState) -> dict:
                 it["paper_id"] = paper_id
                 all_innovations.append(it)
             events.append(f"《{paper['title'][:40]}》抽取 {len(data)} 条创新点")
-        except Exception as e:  # noqa: BLE001 —— 单篇失败不中断整体
-            events.append(f"论文 #{paper_id} 抽取异常：{e}")
-    if not all_innovations:
-        return {"error": "没有成功抽取任何创新点", "events": events}
-    return {"innovations": all_innovations, "events": events}
+        if not all_innovations:
+            return {"error": "没有成功抽取任何创新点", "events": events}
+        return {"innovations": all_innovations, "events": events}
+    except Exception as e:  # noqa: BLE001 —— 节点边界兜底，异常转中文错误
+        return {"error": f"创新点抽取失败：{e}"}
 
 
 def generate_node(state: InnovateState) -> dict:

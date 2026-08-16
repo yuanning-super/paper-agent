@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -69,7 +70,7 @@ def ingest_arxiv_paper(arxiv_id: str) -> str:
 
 @tool
 def search_library(query: str, top_k: int = 5) -> str:
-    """在论文库中混合检索（关键词 + 语义）。返回与查询最相关的论文片段。
+    """在论文库中检索（Milvus BM25 倒排；启用 embedding 时为混合检索）。返回与查询最相关的论文片段。
     当用户询问论文库内容、或需要引用具体论文细节时调用。"""
     try:
         hits = hybrid_search(query, top_k=top_k)
@@ -212,6 +213,75 @@ def analyze_github_repo(url: str) -> str:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------- 解读专用：章节与仓库文件按需读取 ----------
+
+_section_cache: dict[int, list[dict]] = {}
+
+
+def set_section_cache(paper_id: int, sections: list[dict]) -> None:
+    """解读流水线在章节拆分后写入，供 read_section 按需读取（进程内缓存）。"""
+    _section_cache[paper_id] = sections
+
+
+def get_section_cache(paper_id: int) -> list[dict]:
+    return _section_cache.get(paper_id, [])
+
+
+@tool
+def read_section(paper_id: int, index: int) -> str:
+    """按编号读取论文章节的全文（编号从 0 开始，与章节目录一致）。
+    先看章节目录，需要哪节细节时再按需取，避免一次性读入全文。"""
+    sections = _section_cache.get(paper_id)
+    if not sections:
+        return _error(f"论文 #{paper_id} 的章节尚未加载")
+    if not 0 <= index < len(sections):
+        return _error(f"章节编号 {index} 越界（共 {len(sections)} 节）")
+    sec = sections[index]
+    content = sec["content"] if len(sec["content"]) <= 12_000 else truncate(sec["content"], 12_000, mode="head")
+    return json.dumps(
+        {"ok": True, "index": index, "title": sec["title"], "content": content},
+        ensure_ascii=False,
+    )
+
+
+_repo_cache: dict[str, str] = {}  # 仓库 url → 本地克隆目录（进程内复用）
+
+
+def _get_repo_clone(url: str) -> str:
+    if url in _repo_cache and Path(_repo_cache[url]).exists():
+        return _repo_cache[url]
+    dest = load_settings().clones_dir / "repos" / hashlib.sha1(url.encode()).hexdigest()[:12]
+    if not dest.exists():
+        proc = subprocess.run(
+            ["git", "clone", "--depth", "1", "--single-branch", url, str(dest)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"克隆失败：{(proc.stderr or '').strip()[-300:]}")
+    _repo_cache[url] = str(dest)
+    return str(dest)
+
+
+@tool
+def read_repo_file(url: str, path: str) -> str:
+    """读取 GitHub 仓库中的指定文件（相对路径，如 csrc/flash_attn/fwd.cu）。
+    分析论文方法实现时按需查看代码；先用 analyze_github_repo 了解目录结构。"""
+    try:
+        repo = Path(_get_repo_clone(url))
+        target = (repo / path).resolve()
+        if not target.is_file() or not target.is_relative_to(repo.resolve()):
+            return _error(f"文件不存在或路径非法：{path}")
+        text = "\n".join(target.read_text(encoding="utf-8", errors="ignore").splitlines()[:200])
+        return _limit({"ok": True, "path": path, "content": text})
+    except Exception as e:  # noqa: BLE001
+        return _error(f"读取失败：{e}")
+
+
+# ---------- GitHub 仓库整体分析 ----------
+
 def _find_readme(repo: Path) -> str:
     for name in ("README.md", "readme.md", "README.rst", "README"):
         p = repo / name
@@ -286,6 +356,8 @@ TOOL_LIST = [
     search_library,
     find_github_url,
     analyze_github_repo,
+    read_repo_file,
+    read_section,
     get_innovations,
     get_paper_summary,
 ]
